@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     embedding_query: str = "text-search-query/latest"
 
     # Хранилища
+    vector_store_id: str = ""  # индекс AI Studio Vector Store (создаётся командой create-index)
     pg_dsn: str = "postgresql://copilot:copilot@localhost:5432/copilot"
     s3_bucket: str = "copilot1c-sources"
     project: str = Field(default="ut11-update", description="Код проекта для фильтров индекса")

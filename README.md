@@ -71,7 +71,7 @@ uv run copilot1c parse-code path/to/dump --config "УТ 11.5.27.75"
 
 ```bash
 uv run copilot1c init-db
-export COPILOT_VECTOR_STORE_ID=$(uv run copilot1c create-index ut11-update)
+uv run copilot1c create-index ut11-update   # выведет id — впишите его в .env как COPILOT_VECTOR_STORE_ID
 uv run copilot1c index-docs data/mails data/docs --llm-entities
 uv run copilot1c ask "Почему обновляемся на 11.5.27.75, а не на 11.6?"
 ```

@@ -90,8 +90,17 @@ def init_db():
     typer.echo("Схема создана")
 
 
+def _vector_store(value: str | None) -> str:
+    """Идентификатор индекса: опция --vector-store, иначе COPILOT_VECTOR_STORE_ID из окружения или .env."""
+    vs = value or get_settings().vector_store_id
+    if not vs:
+        raise typer.BadParameter("Задайте COPILOT_VECTOR_STORE_ID в .env или передайте --vector-store "
+                                 "(создать индекс: copilot1c create-index <имя>)")
+    return vs
+
+
 @app.command("index-docs")
-def index_docs(paths: list[Path], vector_store: str = typer.Option(..., envvar="COPILOT_VECTOR_STORE_ID"),
+def index_docs(paths: list[Path], vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
                llm_entities: bool = typer.Option(False, help="Дополнительно извлекать сущности LLM")):
     """Проиндексировать почту и документы: Vector Store + граф и реестры в PostgreSQL."""
     from copilot1c.graph.store import GraphStore
@@ -100,7 +109,7 @@ def index_docs(paths: list[Path], vector_store: str = typer.Option(..., envvar="
 
     corpus = _corpus(paths)
     chunks = corpus.chunks()
-    ids = VectorIndex(vector_store).add(chunks)
+    ids = VectorIndex(_vector_store(vector_store)).add(chunks)
     project = get_settings().project
     with GraphStore() as g:
         g.upsert_chunks(chunks, {c.chunk_id: i for c, i in zip(chunks, ids, strict=True)})
@@ -127,7 +136,7 @@ def create_index(name: str):
 
 
 @app.command("ask")
-def ask(question: str, vector_store: str = typer.Option(..., envvar="COPILOT_VECTOR_STORE_ID"),
+def ask(question: str, vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
         dumps_root: Path = typer.Option(Path("data/dumps"))):
     """Задать вопрос агенту."""
     from copilot1c.agent.tools import ToolContext
@@ -136,7 +145,7 @@ def ask(question: str, vector_store: str = typer.Option(..., envvar="COPILOT_VEC
 
     s = get_settings()
     with GraphStore() as g:
-        typer.echo(agent_ask(question, ToolContext(s, vector_store, dumps_root, g)))
+        typer.echo(agent_ask(question, ToolContext(s, _vector_store(vector_store), dumps_root, g)))
 
 
 if __name__ == "__main__":
