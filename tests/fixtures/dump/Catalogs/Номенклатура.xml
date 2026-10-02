@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" version="2.17">
+	<Catalog uuid="00000000-0000-0000-0000-000000000001">
+		<Properties>
+			<ObjectBelonging>Adopted</ObjectBelonging>
+			<Name>Номенклатура</Name>
+			<Synonym>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Номенклатура</v8:content>
+				</v8:item>
+			</Synonym>
+		</Properties>
+		<ChildObjects>
+			<Attribute uuid="00000000-0000-0000-0000-000000000002">
+				<Properties>
+					<Name>КС_Гамма</Name>
+					<Synonym>
+						<v8:item>
+							<v8:lang>ru</v8:lang>
+							<v8:content>Гамма (КС)</v8:content>
+						</v8:item>
+					</Synonym>
+					<Type>
+						<v8:Type>cfg:CatalogRef.КС_Гамма</v8:Type>
+					</Type>
+				</Properties>
+			</Attribute>
+			<TabularSection uuid="00000000-0000-0000-0000-000000000003">
+				<Properties>
+					<Name>КС_Аналоги</Name>
+				</Properties>
+				<ChildObjects>
+					<Attribute uuid="00000000-0000-0000-0000-000000000004">
+						<Properties>
+							<Name>Аналог</Name>
+						</Properties>
+					</Attribute>
+				</ChildObjects>
+			</TabularSection>
+		</ChildObjects>
+	</Catalog>
+</MetaDataObject>

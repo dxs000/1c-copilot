@@ -1,7 +1,41 @@
 [project]
 name = "1c-copilot"
 version = "0.1.0"
-description = "Add your description here"
+description = "1С Project Copilot: аналитическая RAG-система по переписке, ТЗ, ПиМИ и коду конфигураций 1С на Yandex Cloud AI Studio"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "typer>=0.12",
+    "python-docx>=1.1",
+    "extract-msg>=0.48",
+    "openai>=1.40",
+    "psycopg[binary]>=3.2",
+    "lxml>=5.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+copilot1c = "copilot1c.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/copilot1c"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 125
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008"]  # typer.Option в значениях по умолчанию — штатная идиома typer

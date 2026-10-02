@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+dist/
+
+# Исходные материалы проекта и выгрузки конфигураций — не в Git этого репозитория
+data/
+*.msg
+*.eml
+*.cf
+*.cfe
+*.epf
+*.erf
+*.dt
