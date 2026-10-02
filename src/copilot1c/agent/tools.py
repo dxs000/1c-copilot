@@ -17,12 +17,22 @@ from copilot1c.code1c.platform import Designer
 from copilot1c.config import Settings, get_settings
 from copilot1c.graph.store import GraphStore
 from copilot1c.index.yandex import VectorIndex, client
+from copilot1c.retrieval import format_hits, smart_search
 
-SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта внедрения 1С.
-Отвечай по-русски. Каждое утверждение подкрепляй источником: письмо (дата, автор), пункт ТЗ,
-№ тест-кейса ПиМИ, путь к модулю и строки. Утверждение без источника помечай как предположение.
-Аналитические вопросы («что не покрыто», «что затронет обновление») решай в несколько шагов:
-поиск → граф → SQL. Объекты с префиксом КС_ или суффиксом (КС) — доработки интегратора.
+SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта внедрения 1С. Отвечай по-русски, коротко и по делу.
+
+Источники. Каждое утверждение подкрепляй источником в человекочитаемом виде — так, как он указан в
+поле «источник» найденного фрагмента: письмо (тема, дата, автор), документ (название, редакция,
+раздел или пункт), № тест-кейса ПиМИ, путь к модулю и строки. Никогда не указывай внутренние
+идентификаторы файлов и чанков, не придумывай номера страниц. Утверждение без источника помечай
+как предположение.
+
+Порядок работы. В сообщении пользователя уже есть найденные фрагменты. Если их достаточно — сразу
+отвечай, без вызова инструментов. Инструменты вызывай, только если нужного факта во фрагментах нет;
+не повторяй один и тот же запрос. Аналитические вопросы («что не покрыто», «что затронет
+обновление») решай в несколько шагов: поиск → граф → SQL.
+
+Предметная область. Объекты с префиксом КС_ или суффиксом (КС) — доработки интегратора.
 Сгенерированный код перед выдачей проверяй инструментом build_and_check."""
 
 
@@ -62,8 +72,13 @@ class ToolContext:
     store: GraphStore | None = None
 
 
+def _raw_search(ctx: ToolContext) -> Callable[[str, dict, int], list[dict]]:
+    index = VectorIndex(ctx.vector_store_id, ctx.settings)
+    return lambda q, f, k: index.search(q, filters=f, k=k)
+
+
 def _search(ctx: ToolContext, query: str, filters: dict[str, str], k: int) -> list[dict]:
-    return VectorIndex(ctx.vector_store_id, ctx.settings).search(query, filters=filters, k=k)
+    return format_hits(smart_search(_raw_search(ctx), query, filters, k))
 
 
 def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
@@ -118,30 +133,82 @@ def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
                                      build_and_check)}
 
 
-def ask(question: str, ctx: ToolContext, max_steps: int = 8) -> str:
-    """Цикл агента: модель вызывает инструменты, пока не даст финальный ответ."""
+@dataclass
+class AgentResult:
+    answer: str
+    trace: list[dict]  # вызовы инструментов: {"tool", "args", "result_chars" | "repeat" | "error"}
+    steps: int
+
+
+def available_tools(ctx: ToolContext) -> list[dict]:
+    unavailable: set[str] = set()
+    if ctx.store is None:  # без PostgreSQL инструменты графа и реестров не предлагаются вовсе
+        unavailable |= {"graph_query", "sql"}
+    if not ctx.dumps_root.exists():  # код 1С ещё не выгружен и не проиндексирован
+        unavailable |= {"get_module", "diff_versions", "search_code"}
+    if not Path(ctx.settings.onec_bin).exists():
+        unavailable.add("build_and_check")
+    return [t for t in TOOLS if t["function"]["name"] not in unavailable]
+
+
+def _prefetch_message(question: str, ctx: ToolContext, k: int) -> str:
+    """Поиск до первого вызова модели: на простые вопросы она отвечает сразу, без цикла инструментов."""
+    try:
+        hits = _search(ctx, question, {"project": ctx.settings.project}, k)
+    except Exception as exc:  # noqa: BLE001 — без предварительного поиска агент всё равно может искать сам
+        return f"{question}\n\n(Предварительный поиск не удался: {type(exc).__name__}. Используй инструменты.)"
+    found = "\n\n".join(f"[{i}] Источник: {h['источник']}\n{h['текст']}" for i, h in enumerate(hits, 1))
+    return f"Вопрос: {question}\n\nНайденные фрагменты:\n\n{found or '(ничего не найдено)'}"
+
+
+def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: int = 8) -> AgentResult:
+    """Цикл агента: предварительный поиск → модель с инструментами → обязательный финальный ответ."""
     s = ctx.settings or get_settings()
     handlers = make_handlers(ctx)
-    # Без PostgreSQL инструменты графа и реестров не предлагаются модели вовсе
-    unavailable = set() if ctx.store is not None else {"graph_query", "sql"}
-    if not ctx.dumps_root.exists():
-        unavailable |= {"get_module", "diff_versions"}
-    tools = [t for t in TOOLS if t["function"]["name"] not in unavailable]
+    tools = available_tools(ctx)
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT},
-                                      {"role": "user", "content": question}]
-    for _ in range(max_steps):
-        resp = client(s).chat.completions.create(model=s.model_uri(s.model_orchestrator), messages=messages,
-                                                 tools=tools, temperature=0.1)
+                                      {"role": "user", "content": _prefetch_message(question, ctx, prefetch_k)}]
+    trace: list[dict] = []
+    seen_calls: dict[str, str] = {}
+    model = s.model_uri(s.model_orchestrator)
+
+    for step in range(1, max_steps + 1):
+        resp = client(s).chat.completions.create(model=model, messages=messages, tools=tools, temperature=0.1)
         msg = resp.choices[0].message
         if not msg.tool_calls:
-            return msg.content or ""
+            if msg.content:
+                return AgentResult(msg.content, trace, step)
+            break
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
-            try:
-                args = json.loads(call.function.arguments or "{}")
-                result = handlers[call.function.name](**args)
-            except Exception as exc:  # ошибка инструмента возвращается модели, а не роняет цикл
-                result = {"error": f"{type(exc).__name__}: {exc}"}
-            messages.append({"role": "tool", "tool_call_id": call.id,
-                             "content": json.dumps(result, ensure_ascii=False, default=str)[:30000]})
-    return "Не удалось получить ответ за отведённое число шагов."
+            key = f"{call.function.name}:{call.function.arguments}"
+            entry: dict[str, Any] = {"tool": call.function.name, "args": call.function.arguments}
+            if key in seen_calls:  # модель повторяет запрос — не тратим время, напоминаем о результате
+                content = "Этот вызов уже выполнялся, результат выше. Отвечай по имеющимся данным."
+                entry["repeat"] = True
+            else:
+                try:
+                    args = json.loads(call.function.arguments or "{}")
+                    result = handlers[call.function.name](**args)
+                except Exception as exc:  # ошибка инструмента возвращается модели, а не роняет цикл
+                    result = {"error": f"{type(exc).__name__}: {exc}"}
+                    entry["error"] = result["error"]
+                content = json.dumps(result, ensure_ascii=False, default=str)[:30000]
+                seen_calls[key] = content
+                entry["result_chars"] = len(content)
+            trace.append(entry)
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+
+    # Лимит шагов исчерпан: просим ответ по уже собранному, без новых вызовов
+    messages.append({"role": "user", "content": "Инструменты больше недоступны. Дай окончательный ответ по уже "
+                                                "найденным данным, с источниками; чего не нашлось — так и скажи."})
+    try:
+        resp = client(s).chat.completions.create(model=model, messages=messages, tools=tools, tool_choice="none",
+                                                 temperature=0.1)
+    except Exception:  # noqa: BLE001 — если tool_choice не поддержан, повторяем без инструментов
+        resp = client(s).chat.completions.create(model=model, messages=messages, temperature=0.1)
+    return AgentResult(resp.choices[0].message.content or "Ответ не получен.", trace, max_steps + 1)
+
+
+def ask(question: str, ctx: ToolContext, max_steps: int = 6) -> str:
+    return run_agent(question, ctx, max_steps).answer

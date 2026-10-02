@@ -81,7 +81,8 @@ def document_chunks(doc: ParsedDocument, project: str = "") -> list[Chunk]:
 
     if doc.removed:
         for i, group in enumerate(_pack(doc.removed)):
-            chunks.append(make(f"{head}\nУдалённые (зачёркнутые) формулировки:\n" + "\n".join(f"– {r}" for r in group),
+            chunks.append(make(f"{head}\nУдалённые (зачёркнутые) формулировки — вычеркнутые, исключённые из документа "
+                               "проверки и требования:\n" + "\n".join(f"– {r}" for r in group),
                                "Удалённые формулировки" + (f" (часть {i + 1})" if i else ""), revision="removed"))
 
     for t in doc.tables:

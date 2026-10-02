@@ -48,6 +48,7 @@ class Chunk(BaseModel):
     def attributes(self) -> dict[str, str]:
         """Плоские атрибуты для фильтров поиска (Vector Store принимает строки)."""
         attrs = {
+            "title": self.title[:200],
             "doc_type": self.doc_type.value,
             "source": self.source,
             "project": self.project,

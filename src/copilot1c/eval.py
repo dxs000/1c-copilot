@@ -40,6 +40,8 @@ class CaseResult:
     answer_ok: bool | None = None
     missing_facts: list[str] = field(default_factory=list)
     answer: str = ""
+    agent_steps: int | None = None
+    trace: list[dict] = field(default_factory=list)  # вызовы инструментов агентом
     error: str = ""
     seconds: float = 0.0
 
@@ -75,7 +77,7 @@ def check_answer(case: Case, answer: str) -> tuple[bool, list[str]]:
 
 
 def run(cases: list[Case], search: Callable[[str, dict, int], list[dict]],
-        answer: Callable[[str], str] | None = None, k: int = 10,
+        answer: Callable[[str], object] | None = None, k: int = 10,
         progress: Callable[[str], None] | None = None) -> list[CaseResult]:
     results = []
     for i, case in enumerate(cases, 1):
@@ -86,7 +88,10 @@ def run(cases: list[Case], search: Callable[[str, dict, int], list[dict]],
                 hits = search(case.question, case.filters, k)
                 r.retrieval_hit, r.hit_rank, r.missing_evidence = check_retrieval(case, hits)
             if answer is not None and case.answer_must_contain:
-                r.answer = answer(case.question)
+                out = answer(case.question)  # str или AgentResult (с трассой вызовов инструментов)
+                r.answer = getattr(out, "answer", out)
+                r.trace = list(getattr(out, "trace", []))
+                r.agent_steps = getattr(out, "steps", None)
                 r.answer_ok, r.missing_facts = check_answer(case, r.answer)
         except Exception as exc:  # noqa: BLE001 — один упавший вопрос не останавливает прогон
             r.error = f"{type(exc).__name__}: {exc}"[:300]
@@ -120,7 +125,9 @@ def report_text(results: list[CaseResult], k: int) -> str:
         if r.retrieval_hit is False:
             lines.append(f"✗ поиск  {r.id}: не найдено {r.missing_evidence}")
         if r.answer_ok is False:
-            lines.append(f"✗ ответ  {r.id}: нет {r.missing_facts} — «{r.answer[:160]}…»")
+            calls = ", ".join(t["tool"] + ("↻" if t.get("repeat") else "") for t in r.trace) or "без инструментов"
+            lines.append(f"✗ ответ  {r.id}: нет {r.missing_facts} — шагов {r.agent_steps}, вызовы: {calls} — "
+                         f"«{r.answer[:160]}…»")
     return "\n".join(lines)
 
 

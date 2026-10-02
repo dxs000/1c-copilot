@@ -160,10 +160,10 @@ def create_index(name: str):
 
 @app.command("ask")
 def ask(question: str, vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
-        dumps_root: Path = typer.Option(Path("data/dumps"))):
+        dumps_root: Path = typer.Option(Path("data/dumps")),
+        trace: bool = typer.Option(False, help="Показать вызовы инструментов агентом")):
     """Задать вопрос агенту. Без PostgreSQL работает только поиск по документам и коду."""
-    from copilot1c.agent.tools import ToolContext
-    from copilot1c.agent.tools import ask as agent_ask
+    from copilot1c.agent.tools import ToolContext, run_agent
     from copilot1c.graph.store import try_connect
 
     s = get_settings()
@@ -171,7 +171,13 @@ def ask(question: str, vector_store: str | None = typer.Option(None, help="По 
     if g is None:
         typer.echo("PostgreSQL недоступен: граф и SQL-реестры отключены, отвечаю по поиску в Vector Store.", err=True)
     try:
-        typer.echo(agent_ask(question, ToolContext(s, _vector_store(vector_store), dumps_root, g)))
+        result = run_agent(question, ToolContext(s, _vector_store(vector_store), dumps_root, g))
+        typer.echo(result.answer)
+        if trace:
+            typer.echo(f"\n— шагов модели: {result.steps}", err=True)
+            for t in result.trace:
+                status = "повтор" if t.get("repeat") else t.get("error") or f"{t.get('result_chars', 0)} симв."
+                typer.echo(f"  {t['tool']}({t['args']}) → {status}", err=True)
     finally:
         if g is not None:
             g.close()
@@ -192,21 +198,23 @@ def eval_cmd(golden: Path = typer.Argument(..., help="JSON с эталонным
     index = VectorIndex(vs_id, s)
     cases = ev.load_cases(golden)
 
+    from copilot1c.retrieval import smart_search
+
     def search(question: str, filters: dict, top_k: int) -> list[dict]:
-        return index.search(question, filters={"project": s.project, **filters}, k=top_k)
+        raw = lambda q, f, kk: index.search(q, filters=f, k=kk)  # noqa: E731
+        return smart_search(raw, question, {"project": s.project, **filters}, top_k)
 
     answer = None
     store = None
     if answers:
-        from copilot1c.agent.tools import ToolContext
-        from copilot1c.agent.tools import ask as agent_ask
+        from copilot1c.agent.tools import ToolContext, run_agent
         from copilot1c.graph.store import try_connect
 
         store = try_connect(s)
         ctx = ToolContext(s, vs_id, dumps_root, store)
 
-        def answer(question: str) -> str:
-            return agent_ask(question, ctx)
+        def answer(question: str):
+            return run_agent(question, ctx)
 
     typer.echo(f"Вопросов: {len(cases)}")
     try:
