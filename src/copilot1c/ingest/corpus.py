@@ -18,7 +18,7 @@ from copilot1c.ingest.attachments import ImageText, Skipped, parse_bytes, parse_
 from copilot1c.ingest.chunking import document_chunks
 from copilot1c.ingest.document import ParsedDocument
 from copilot1c.ingest.msg import EmailMessage, ParsedEmail, message_chunk, walk
-from copilot1c.ingest.ocr import ocr
+from copilot1c.ingest.ocr import MIN_IMAGE_BYTES, OcrUnavailable, ocr
 from copilot1c.models import Chunk, DocType
 
 SUPPORTED_GLOB = ("*.msg", "*.eml", "*.docx", "*.docm", "*.pdf", "*.xlsx", "*.xlsm", "*.doc", "*.xls", "*.rtf",
@@ -142,7 +142,13 @@ class Corpus:
             d.received.append(context)
         if self.ocr_images_in_docs:
             for name, data in d.images:
-                text = ocr(data, self.settings or get_settings()) if len(data) >= 20_000 else None
+                if len(data) < MIN_IMAGE_BYTES:
+                    continue
+                try:
+                    text = ocr(data, self.settings or get_settings())
+                except OcrUnavailable as exc:
+                    self.skipped.append(Skipped(f"{d.source}#{name}", name, f"изображение в документе: {exc}"))
+                    continue
                 if text:
                     self.images.append(ImageText(f"{d.source}#{name}", name, text))
         self._doc_keys[key] = len(self.documents)

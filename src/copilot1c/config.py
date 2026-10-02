@@ -31,6 +31,9 @@ class Settings(BaseSettings):
 
     # Распознавание изображений и сканов: auto | yandex | tesseract | none
     ocr_backend: str = "auto"
+    ocr_rps: float = 1.0  # не чаще N запросов в секунду к Vision OCR (квота каталога)
+    ocr_max_retries: int = 5  # повторы при 429/5xx с паузой
+    cache_dir: str = ".cache"  # кэш результатов OCR по хэшу картинки; пусто — без кэша
     # Конвертация старых форматов (.doc, .xls, .rtf, .odt) через LibreOffice
     soffice_bin: str = "soffice"
 

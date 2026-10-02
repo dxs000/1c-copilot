@@ -18,7 +18,7 @@ from copilot1c.ingest.document import (
     guess_doc_type,
     guess_doc_version,
 )
-from copilot1c.ingest.ocr import ocr
+from copilot1c.ingest.ocr import OcrUnavailable, ocr
 from copilot1c.ingest.tables import RawRow, RawTable, _classify, parse_table
 
 _HEADING_RE = re.compile(r"^\s*(\d+(?:\.\d+){0,3})\.?\s+([А-ЯЁA-Z«\"].{2,100})$")
@@ -82,7 +82,11 @@ def parse_pdf(path: str | Path, known_objects: Iterable[str] | None = None, sour
                 img = page.to_image(resolution=200).original
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
-                recognized = ocr(buf.getvalue(), s)
+                try:
+                    recognized = ocr(buf.getvalue(), s)
+                except OcrUnavailable as exc:
+                    warnings.append(f"стр. {page_no}: скан без текстового слоя, {exc}")
+                    continue
                 if recognized is None:
                     warnings.append(f"стр. {page_no}: скан без текстового слоя, OCR недоступен")
                     continue

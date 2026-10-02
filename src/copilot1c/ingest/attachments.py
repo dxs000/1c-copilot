@@ -19,7 +19,7 @@ from openpyxl import load_workbook
 
 from copilot1c.config import Settings, get_settings
 from copilot1c.ingest.document import ParsedDocument, clean_filename, guess_doc_date, guess_doc_type, guess_doc_version
-from copilot1c.ingest.ocr import MIN_IMAGE_BYTES, ocr
+from copilot1c.ingest.ocr import MIN_IMAGE_BYTES, OcrUnavailable, ocr
 from copilot1c.ingest.tables import RawRow, RawTable, parse_table
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
@@ -161,7 +161,10 @@ def parse_bytes(data: bytes, filename: str, source: str, known_objects=None, set
         if kind == "image":
             if len(data) < MIN_IMAGE_BYTES:
                 return [Skipped(source, filename, "маленькое изображение (логотип/иконка)")]
-            text = ocr(data, s)
+            try:
+                text = ocr(data, s)
+            except OcrUnavailable as exc:
+                return [Skipped(source, filename, f"изображение: {exc}")]
             if text is None:
                 return [Skipped(source, filename, "изображение: OCR недоступен (нужен Yandex Vision или tesseract rus)")]
             return [ImageText(source, filename, text)] if text.strip() else []

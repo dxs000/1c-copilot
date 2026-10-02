@@ -19,7 +19,8 @@ from copilot1c.models import Chunk
 
 @lru_cache
 def _client(api_key: str, base_url: str, folder_id: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=base_url, project=folder_id)
+    # SDK сам повторяет 429/5xx с экспоненциальной паузой; квоты AI Studio невысокие — повторов больше умолчания
+    return OpenAI(api_key=api_key, base_url=base_url, project=folder_id, max_retries=6, timeout=120)
 
 
 def client(settings: Settings | None = None) -> OpenAI:
