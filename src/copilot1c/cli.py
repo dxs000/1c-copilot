@@ -99,22 +99,46 @@ def _vector_store(value: str | None) -> str:
     return vs
 
 
+PG_HINT = ("PostgreSQL недоступен ({dsn}) — граф и реестры (тест-кейсы, план тестирования, покрытие) не записаны; "
+           "поиск по Vector Store работает. Локально: docker run -d --name copilot-pg -p 5432:5432 "
+           "-e POSTGRES_USER=copilot -e POSTGRES_PASSWORD=copilot -e POSTGRES_DB=copilot pgvector/pgvector:pg16, "
+           "затем copilot1c init-db и повторный index-docs (уже загруженные чанки не загружаются заново).")
+
+
 @app.command("index-docs")
 def index_docs(paths: list[Path], vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
+               graph: bool = typer.Option(True, help="Записывать граф и реестры в PostgreSQL, если он доступен"),
                llm_entities: bool = typer.Option(False, help="Дополнительно извлекать сущности LLM")):
-    """Проиндексировать почту и документы: Vector Store + граф и реестры в PostgreSQL."""
-    from copilot1c.graph.store import GraphStore
+    """Проиндексировать почту и документы: Vector Store + (если доступен) граф и реестры в PostgreSQL."""
+    from copilot1c.graph.store import try_connect
     from copilot1c.index.yandex import VectorIndex
     from copilot1c.ingest.entities import extract_regex_entities
 
+    s = get_settings()
     corpus = _corpus(paths)
+    typer.echo(corpus.report())
     chunks = corpus.chunks()
-    ids = VectorIndex(_vector_store(vector_store)).add(chunks)
-    project = get_settings().project
-    with GraphStore() as g:
-        g.upsert_chunks(chunks, {c.chunk_id: i for c, i in zip(chunks, ids, strict=True)})
+    typer.echo(f"Чанков: {len(chunks)}")
+
+    index = VectorIndex(_vector_store(vector_store))
+    if not index.load_manifest():
+        try:  # индекс мог быть заполнен прошлым запуском, упавшим до записи манифеста
+            index.rebuild_manifest(typer.echo)
+        except Exception as exc:  # noqa: BLE001 — список файлов индекса не критичен
+            typer.echo(f"Не удалось прочитать содержимое индекса ({type(exc).__name__}); если индекс не пустой, "
+                       "возможны дубли — надёжнее создать новый: copilot1c create-index <имя>", err=True)
+    ids = index.add(chunks, progress=typer.echo)
+    typer.echo(f"Vector Store: в индексе {len(ids)} чанков этого корпуса")
+
+    g = try_connect(s) if graph else None
+    if g is None:
+        if graph:
+            typer.echo(PG_HINT.format(dsn=s.pg_dsn.split("@")[-1]), err=True)
+        return
+    with g:
+        g.upsert_chunks(chunks, ids)
         for d in corpus.documents:
-            g.upsert_registries(project, d)
+            g.upsert_registries(s.project, d)
         for c in chunks:
             g.upsert_entities(extract_regex_entities(c.entity_text()), c.chunk_id)
             if llm_entities:
@@ -123,8 +147,7 @@ def index_docs(paths: list[Path], vector_store: str | None = typer.Option(None, 
                 ents, rels = extract_llm_entities(c.text, c.chunk_id)
                 g.upsert_entities(ents, c.chunk_id)
                 g.upsert_relations(rels)
-    typer.echo(corpus.report())
-    typer.echo(f"Проиндексировано чанков: {len(chunks)}")
+    typer.echo("Граф и реестры записаны в PostgreSQL")
 
 
 @app.command("create-index")
@@ -138,14 +161,20 @@ def create_index(name: str):
 @app.command("ask")
 def ask(question: str, vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
         dumps_root: Path = typer.Option(Path("data/dumps"))):
-    """Задать вопрос агенту."""
+    """Задать вопрос агенту. Без PostgreSQL работает только поиск по документам и коду."""
     from copilot1c.agent.tools import ToolContext
     from copilot1c.agent.tools import ask as agent_ask
-    from copilot1c.graph.store import GraphStore
+    from copilot1c.graph.store import try_connect
 
     s = get_settings()
-    with GraphStore() as g:
+    g = try_connect(s)
+    if g is None:
+        typer.echo("PostgreSQL недоступен: граф и SQL-реестры отключены, отвечаю по поиску в Vector Store.", err=True)
+    try:
         typer.echo(agent_ask(question, ToolContext(s, _vector_store(vector_store), dumps_root, g)))
+    finally:
+        if g is not None:
+            g.close()
 
 
 if __name__ == "__main__":

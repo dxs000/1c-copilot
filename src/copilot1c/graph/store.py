@@ -14,10 +14,18 @@ from copilot1c.ingest.document import ParsedDocument
 from copilot1c.models import Chunk, Entity, Relation
 
 
+def try_connect(settings: Settings | None = None) -> GraphStore | None:
+    """Граф необязателен: без PostgreSQL индексация и поиск работают, недоступны только реестры и SQL."""
+    try:
+        return GraphStore(settings=settings)
+    except psycopg.OperationalError:
+        return None
+
+
 class GraphStore:
     def __init__(self, dsn: str | None = None, settings: Settings | None = None):
         s = settings or get_settings()
-        self.conn = psycopg.connect(dsn or s.pg_dsn, autocommit=False)
+        self.conn = psycopg.connect(dsn or s.pg_dsn, autocommit=False, connect_timeout=5)
 
     def close(self) -> None:
         self.conn.close()

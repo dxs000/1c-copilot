@@ -122,11 +122,16 @@ def ask(question: str, ctx: ToolContext, max_steps: int = 8) -> str:
     """Цикл агента: модель вызывает инструменты, пока не даст финальный ответ."""
     s = ctx.settings or get_settings()
     handlers = make_handlers(ctx)
+    # Без PostgreSQL инструменты графа и реестров не предлагаются модели вовсе
+    unavailable = set() if ctx.store is not None else {"graph_query", "sql"}
+    if not ctx.dumps_root.exists():
+        unavailable |= {"get_module", "diff_versions"}
+    tools = [t for t in TOOLS if t["function"]["name"] not in unavailable]
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT},
                                       {"role": "user", "content": question}]
     for _ in range(max_steps):
         resp = client(s).chat.completions.create(model=s.model_uri(s.model_orchestrator), messages=messages,
-                                                 tools=TOOLS, temperature=0.1)
+                                                 tools=tools, temperature=0.1)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return msg.content or ""

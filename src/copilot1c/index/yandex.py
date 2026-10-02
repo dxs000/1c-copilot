@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
@@ -69,14 +70,61 @@ class VectorIndex:
         vs = client(s).vector_stores.create(name=name)
         return cls(vs.id, s)
 
-    def add(self, chunks: Iterable[Chunk]) -> list[str]:
+    # --- загрузка с манифестом: повторный запуск не загружает те же чанки второй раз ---
+
+    @property
+    def manifest_path(self) -> Path:
+        return Path(self.s.cache_dir or ".cache") / "vector_store" / f"{self.id}.json"
+
+    def load_manifest(self) -> dict[str, str]:
+        """chunk_id → file_id уже загруженных чанков."""
+        if self.manifest_path.exists():
+            return json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        return {}
+
+    def _save_manifest(self, manifest: dict[str, str]) -> None:
+        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.manifest_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=0), encoding="utf-8")
+        tmp.replace(self.manifest_path)
+
+    def rebuild_manifest(self, progress: Callable[[str], None] = print) -> dict[str, str]:
+        """Восстанавливает манифест по файлам, уже лежащим в индексе (имя файла = chunk_id.md).
+
+        Нужен, если чанки загружались без манифеста (например, запуск упал после загрузки)."""
         c = client(self.s)
-        ids: list[str] = []
-        for ch in chunks:
+        manifest: dict[str, str] = {}
+        for vf in c.vector_stores.files.list(vector_store_id=self.id, limit=100):
+            attrs = getattr(vf, "attributes", None) or {}
+            chunk_id = attrs.get("chunk_id")
+            if not chunk_id:
+                name = c.files.retrieve(vf.id).filename or ""
+                chunk_id = name.removesuffix(".md")
+            if chunk_id:
+                manifest[chunk_id] = vf.id
+        self._save_manifest(manifest)
+        progress(f"В индексе уже есть чанков: {len(manifest)}")
+        return manifest
+
+    def add(self, chunks: Iterable[Chunk], progress: Callable[[str], None] | None = None,
+            every: int = 25) -> dict[str, str]:
+        """Загружает чанки, которых ещё нет в индексе. Возвращает chunk_id → file_id для всех чанков."""
+        c = client(self.s)
+        manifest = self.load_manifest()
+        chunks = list(chunks)
+        todo = [ch for ch in chunks if ch.chunk_id not in manifest]
+        if progress and len(todo) < len(chunks):
+            progress(f"Уже в индексе: {len(chunks) - len(todo)}, загружаю новых: {len(todo)}")
+        for i, ch in enumerate(todo, 1):
             f = c.files.create(file=(f"{ch.chunk_id}.md", ch.text.encode("utf-8")), purpose="assistants")
-            c.vector_stores.files.create(vector_store_id=self.id, file_id=f.id, attributes=ch.attributes())
-            ids.append(f.id)
-        return ids
+            c.vector_stores.files.create(vector_store_id=self.id, file_id=f.id,
+                                         attributes={**ch.attributes(), "chunk_id": ch.chunk_id})
+            manifest[ch.chunk_id] = f.id
+            if i % every == 0 or i == len(todo):
+                self._save_manifest(manifest)  # после сбоя загрузка продолжится с этого места
+                if progress:
+                    progress(f"  загружено {i}/{len(todo)}")
+        return {ch.chunk_id: manifest[ch.chunk_id] for ch in chunks}
 
     def search(self, query: str, *, filters: dict[str, str] | None = None, k: int = 10) -> list[dict[str, Any]]:
         flt = None
