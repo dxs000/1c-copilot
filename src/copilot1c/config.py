@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     s3_bucket: str = "copilot1c-sources"
     project: str = Field(default="ut11-update", description="Код проекта для фильтров индекса")
 
+    # Распознавание изображений и сканов: auto | yandex | tesseract | none
+    ocr_backend: str = "auto"
+    # Конвертация старых форматов (.doc, .xls, .rtf, .odt) через LibreOffice
+    soffice_bin: str = "soffice"
+
     # Платформа 1С на ВМ-песочнице
     onec_bin: str = "/opt/1cv8/x86_64/8.3.27.2342/1cv8"
     ibcmd_bin: str = "/opt/1cv8/x86_64/8.3.27.2342/ibcmd"

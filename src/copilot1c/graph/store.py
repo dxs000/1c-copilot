@@ -10,7 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from copilot1c.config import Settings, get_settings
-from copilot1c.ingest.docx import TestCase
+from copilot1c.ingest.document import ParsedDocument
 from copilot1c.models import Chunk, Entity, Relation
 
 
@@ -71,13 +71,28 @@ class GraphStore:
                 [(r.src, r.rel, r.dst, r.source_chunk) for r in relations],
             )
 
-    def upsert_test_cases(self, project: str, doc: str, cases: Iterable[TestCase]) -> None:
+    def upsert_registries(self, project: str, doc: ParsedDocument) -> None:
+        """Тест-кейсы, пункты плана и покрытие документа — в реестры для SQL-аналитики агента."""
+        name = doc.title[:200] + (f" (ред. {doc.version})" if doc.version else "")
         with self.conn.cursor() as cur:
             cur.executemany(
-                """INSERT INTO test_cases VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (project, doc, num) DO UPDATE SET result = EXCLUDED.result""",
-                [(project, doc, t.num, t.section, t.function, t.method, t.criterion, t.result, t.objects)
-                 for t in cases],
+                """INSERT INTO test_cases (project, doc, num, section, function, steps, result, objects, source)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (project, doc, num) DO UPDATE SET steps = EXCLUDED.steps, result = EXCLUDED.result""",
+                [(project, name, t.num, t.section, t.function,
+                  json.dumps([vars(st) for st in t.steps], ensure_ascii=False), t.result, t.objects, doc.source)
+                 for t in doc.test_cases],
+            )
+            cur.executemany(
+                """INSERT INTO requirements (project, req_id, doc, grp, object, text, objects, source)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (project, req_id, doc) DO UPDATE SET text = EXCLUDED.text, objects = EXCLUDED.objects""",
+                [(project, p.num, name, p.group, p.object, p.text(), p.objects, doc.source) for p in doc.plan_items],
+            )
+            cur.executemany(
+                """INSERT INTO requirement_tests (project, req_id, doc, test_doc, test_num, coverage)
+                   VALUES (%s,%s,%s,%s,'*',%s) ON CONFLICT DO NOTHING""",
+                [(project, item, name, c.document, c.coverage) for c in doc.coverage for item in c.items],
             )
 
     def query(self, sql: str, params: tuple | dict = ()) -> list[dict]:
@@ -85,7 +100,7 @@ class GraphStore:
         self.conn.commit()  # SET TRANSACTION должен открывать новую транзакцию
         with self.conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SET TRANSACTION READ ONLY")
-            cur.execute(sql, params)
+            cur.execute(sql, params or None)  # без параметров «%» в LIKE не считается плейсхолдером
             rows = cur.fetchall()
         self.conn.rollback()
         return rows

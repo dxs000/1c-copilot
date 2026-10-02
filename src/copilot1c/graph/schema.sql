@@ -1,5 +1,10 @@
 -- Граф знаний и реестры «1С Project Copilot» (Managed PostgreSQL + pgvector)
-CREATE EXTENSION IF NOT EXISTS vector;
+-- pgvector есть в Managed PostgreSQL Yandex Cloud; локально без него схема тоже создаётся
+DO $$ BEGIN
+    CREATE EXTENSION IF NOT EXISTS vector;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'pgvector недоступен: колонка chunks.embedding не создаётся';
+END $$;
 
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id     text PRIMARY KEY,
@@ -13,9 +18,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     objects      text[] NOT NULL DEFAULT '{}',
     attrs        jsonb  NOT NULL DEFAULT '{}',
     text         text   NOT NULL,
-    vs_file_id   text,             -- id файла в AI Studio Vector Store
-    embedding    vector(256)       -- резервный локальный поиск; размерность сверить с моделью
+    vs_file_id   text              -- id файла в AI Studio Vector Store
 );
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        -- резервный локальный поиск; размерность сверить с моделью эмбеддингов
+        ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding vector(256);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS chunks_objects_idx ON chunks USING gin (objects);
 CREATE INDEX IF NOT EXISTS chunks_type_idx ON chunks (project, doc_type);
 
@@ -43,35 +53,41 @@ CREATE TABLE IF NOT EXISTS mentions (
 );
 
 -- Реестры для аналитики (агрегаты через инструмент sql)
+-- Требования: пункты плана тестирования ТЗ (Приложение 1) и пункты ТЗ
 CREATE TABLE IF NOT EXISTS requirements (
     project   text NOT NULL,
-    req_id    text NOT NULL,       -- номер пункта ТЗ
-    doc       text NOT NULL,       -- ТЗ ред. N
+    req_id    text NOT NULL,       -- № пункта плана тестирования / пункта ТЗ
+    doc       text NOT NULL,       -- «ТЗ … (ред. 2.0)», «ДС № 10 … (ред. 3)»
+    grp       text,                -- группа плана: «3. НСИ», «1.1 EDI FML»
+    object    text,                -- объект проверки
     text      text NOT NULL,
     status    text,                -- согласовано / на согласовании / исключено
     objects   text[] NOT NULL DEFAULT '{}',
+    source    text,
     PRIMARY KEY (project, req_id, doc)
 );
 
 CREATE TABLE IF NOT EXISTS test_cases (
     project    text NOT NULL,
-    doc        text NOT NULL,      -- ПиМИ
+    doc        text NOT NULL,      -- заголовок ПиМИ
     num        text NOT NULL,
     section    text,
     function   text,
-    method     text,
-    criterion  text,
-    result     text,               -- Работает / Не работает / …
+    steps      jsonb NOT NULL DEFAULT '[]',   -- [{method, criterion, result}]
+    result     text,               -- итог по шагам: Работает / Не работает / …
     objects    text[] NOT NULL DEFAULT '{}',
+    source     text,
     PRIMARY KEY (project, doc, num)
 );
 
+-- Покрытие требований: из таблицы ТЗ «документ → пункты плана» (test_num = '*') или ручная/LLM-разметка
 CREATE TABLE IF NOT EXISTS requirement_tests (
     project  text NOT NULL,
     req_id   text NOT NULL,
     doc      text NOT NULL,
     test_doc text NOT NULL,
-    test_num text NOT NULL,
+    test_num text NOT NULL DEFAULT '*',
+    coverage text,                 -- «Полное», «Полное при условии п. 129…»
     PRIMARY KEY (project, req_id, doc, test_doc, test_num)
 );
 

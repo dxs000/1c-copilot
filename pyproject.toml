@@ -13,6 +13,10 @@ dependencies = [
     "openai>=1.40",
     "psycopg[binary]>=3.2",
     "lxml>=5.2",
+    "pdfplumber>=0.11.10",
+    "python-dateutil>=2.9.0.post0",
+    "openpyxl>=3.1.5",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +34,7 @@ packages = ["src/copilot1c"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 
 [tool.ruff]
 line-length = 125

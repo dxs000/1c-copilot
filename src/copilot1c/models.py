@@ -33,6 +33,12 @@ class Chunk(BaseModel):
     author: str | None = None
     objects: list[str] = Field(default_factory=list)  # объекты метаданных 1С
     extra: dict[str, str] = Field(default_factory=dict)
+    # Содержательная часть без шапки (название документа, раздел): по ней извлекаются сущности,
+    # чтобы название документа не «упоминало» одни и те же версии в каждом чанке
+    body: str = ""
+
+    def entity_text(self) -> str:
+        return self.body or self.text
 
     @property
     def chunk_id(self) -> str:

@@ -17,30 +17,14 @@ from copilot1c.models import Chunk
 app = typer.Typer(help="1С Project Copilot", no_args_is_help=True)
 
 
-def _collect(paths: list[Path]) -> list[Chunk]:
-    from copilot1c.ingest.docx import docx_chunks
-    from copilot1c.ingest.msg import email_chunks, parse_msg
+def _corpus(paths: list[Path]):
+    from copilot1c.ingest.corpus import Corpus
 
-    project = get_settings().project
-    chunks: list[Chunk] = []
-    for p in paths:
-        files = sorted(p.rglob("*")) if p.is_dir() else [p]
-        for f in files:
-            suffix = f.suffix.lower()
-            if suffix == ".msg":
-                email = parse_msg(f)
-                chunks += email_chunks(email, project)
-                for att in email.attachments:  # вложенные документы разбираются сразу
-                    if att.filename.lower().endswith(".docx"):
-                        tmp = f.with_name(f".{f.stem}__{att.filename}")
-                        tmp.write_bytes(att.data)
-                        try:
-                            chunks += docx_chunks(tmp, project, source=f"{f}#{att.filename}")
-                        finally:
-                            tmp.unlink(missing_ok=True)
-            elif suffix == ".docx" and not f.name.startswith("~$"):
-                chunks += docx_chunks(f, project)
-    return chunks
+    return Corpus(project=get_settings().project).add_paths(paths)
+
+
+def _collect(paths: list[Path]) -> list[Chunk]:
+    return _corpus(paths).chunks()
 
 
 def _print(chunks: list[Chunk], as_json: bool) -> None:
@@ -56,9 +40,13 @@ def _print(chunks: list[Chunk], as_json: bool) -> None:
 
 
 @app.command("parse-docs")
-def parse_docs(paths: list[Path], json_out: bool = typer.Option(False, "--json")):
-    """Разобрать письма .msg (с вложениями) и документы .docx в чанки и показать их."""
-    _print(_collect(paths), json_out)
+def parse_docs(paths: list[Path], json_out: bool = typer.Option(False, "--json"),
+               report_only: bool = typer.Option(False, "--report", help="Только сводка без чанков")):
+    """Разобрать письма (.msg/.eml с вложениями), документы (.docx/.pdf/.xlsx/…) и архивы в чанки."""
+    corpus = _corpus(paths)
+    if not report_only:
+        _print(corpus.chunks(), json_out)
+    typer.echo(corpus.report(), err=json_out)
 
 
 @app.command("parse-code")
@@ -105,23 +93,28 @@ def init_db():
 @app.command("index-docs")
 def index_docs(paths: list[Path], vector_store: str = typer.Option(..., envvar="COPILOT_VECTOR_STORE_ID"),
                llm_entities: bool = typer.Option(False, help="Дополнительно извлекать сущности LLM")):
-    """Проиндексировать документы и почту: Vector Store + граф в PostgreSQL."""
+    """Проиндексировать почту и документы: Vector Store + граф и реестры в PostgreSQL."""
     from copilot1c.graph.store import GraphStore
     from copilot1c.index.yandex import VectorIndex
     from copilot1c.ingest.entities import extract_regex_entities
 
-    chunks = _collect(paths)
+    corpus = _corpus(paths)
+    chunks = corpus.chunks()
     ids = VectorIndex(vector_store).add(chunks)
+    project = get_settings().project
     with GraphStore() as g:
         g.upsert_chunks(chunks, {c.chunk_id: i for c, i in zip(chunks, ids, strict=True)})
+        for d in corpus.documents:
+            g.upsert_registries(project, d)
         for c in chunks:
-            g.upsert_entities(extract_regex_entities(c.text), c.chunk_id)
+            g.upsert_entities(extract_regex_entities(c.entity_text()), c.chunk_id)
             if llm_entities:
                 from copilot1c.ingest.entities_llm import extract_llm_entities
 
                 ents, rels = extract_llm_entities(c.text, c.chunk_id)
                 g.upsert_entities(ents, c.chunk_id)
                 g.upsert_relations(rels)
+    typer.echo(corpus.report())
     typer.echo(f"Проиндексировано чанков: {len(chunks)}")
 
 
