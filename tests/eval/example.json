@@ -1,0 +1,6 @@
+[
+  {"id": "platform-compat", "question": "Подходит ли платформа 8.3.27.2342 для УТ 11.5.27.75?",
+   "evidence": ["минимальная версия платформы 8.3.27.1859"], "answer_must_contain": ["8.3.27.1859"]},
+  {"id": "test-server", "question": "На каком сервере обновляют платформу на тестовом окружении?",
+   "evidence": ["custsrvapp01"], "answer_must_contain": ["custsrvapp01"], "filters": {"doc_type": "email"}}
+]

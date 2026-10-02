@@ -177,5 +177,46 @@ def ask(question: str, vector_store: str | None = typer.Option(None, help="По 
             g.close()
 
 
+@app.command("eval")
+def eval_cmd(golden: Path = typer.Argument(..., help="JSON с эталонными вопросами (см. tests/eval/example.json)"),
+             answers: bool = typer.Option(False, help="Проверять и ответы агента (дольше и дороже)"),
+             k: int = typer.Option(10, help="Сколько чанков смотреть в поиске"),
+             vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
+             dumps_root: Path = typer.Option(Path("data/dumps"))):
+    """Оценка качества: recall@k поиска и наличие обязательных фактов в ответах агента."""
+    from copilot1c import eval as ev
+    from copilot1c.index.yandex import VectorIndex
+
+    s = get_settings()
+    vs_id = _vector_store(vector_store)
+    index = VectorIndex(vs_id, s)
+    cases = ev.load_cases(golden)
+
+    def search(question: str, filters: dict, top_k: int) -> list[dict]:
+        return index.search(question, filters={"project": s.project, **filters}, k=top_k)
+
+    answer = None
+    store = None
+    if answers:
+        from copilot1c.agent.tools import ToolContext
+        from copilot1c.agent.tools import ask as agent_ask
+        from copilot1c.graph.store import try_connect
+
+        store = try_connect(s)
+        ctx = ToolContext(s, vs_id, dumps_root, store)
+
+        def answer(question: str) -> str:
+            return agent_ask(question, ctx)
+
+    typer.echo(f"Вопросов: {len(cases)}")
+    try:
+        results = ev.run(cases, search, answer, k=k, progress=typer.echo)
+    finally:
+        if store is not None:
+            store.close()
+    typer.echo(ev.report_text(results, k))
+    typer.echo(f"Подробно: {ev.save(results, k, Path(s.cache_dir or '.cache') / 'eval')}")
+
+
 if __name__ == "__main__":
     app()
