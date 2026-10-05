@@ -154,3 +154,22 @@ def test_background_worker_processes_queue(env, monkeypatch):
             time.sleep(0.25)
         assert m["status"] == "done", m
         assert c.get("/health").json()["checks"]["materials_worker"]["ok"] is True
+
+
+def test_indexing_detail_is_per_file(env, tmp_path):
+    """Во время индексации у каждого файла своя подпись: сколько новых фрагментов именно из него."""
+    s, g, index, root = env
+    seen = {}
+
+    class Spy(FakeIndex):
+        def add(self, chunks, progress=None):
+            for r in g.query("SELECT filename, detail FROM materials WHERE project = 'test-proj'"):
+                seen[r["filename"]] = r["detail"]
+            return super().add(chunks)
+
+    spy = Spy(index.manifest)
+    _upload(s, [("ПиМИ.docx", make_pimi(tmp_path / "p.docx").read_bytes()),
+                ("копия.eml", (root / "data" / "mails" / "RE Обновление.eml").read_bytes())])
+    _run(s, g, spy)
+    assert seen["ПиМИ.docx"].startswith("загружаю в индекс новые фрагменты: ")
+    assert seen["копия.eml"].startswith("новых фрагментов в файле нет")

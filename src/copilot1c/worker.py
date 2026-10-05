@@ -113,9 +113,10 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
 
         index = index or VectorIndex(s.vector_store_id, s)
         before = set(index.load_manifest())
-        new_total = sum(c.chunk_id not in before for c in chunks)
-        for m in batch:
-            reg.set_status(m["id"], "indexing", f"загружаю в индекс новых фрагментов: {new_total}")
+        for m in batch:  # подпись этапа — по самому файлу, а не по всей пачке
+            own_new = sum(c.chunk_id not in before for c in chunks if _owned(c.source, m["path"]))
+            reg.set_status(m["id"], "indexing", f"загружаю в индекс новые фрагменты: {own_new}" if own_new else
+                           "новых фрагментов в файле нет — жду окончания обработки пачки")
         ids = index.add(chunks)
 
         for m in batch:
