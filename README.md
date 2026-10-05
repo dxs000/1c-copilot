@@ -83,6 +83,26 @@ uv run copilot1c unpack data/cf/UT11.cf data/dumps/ut11-5-27-75
 uv run copilot1c unpack data/cfe/KS.cfe data/dumps/ks --extension КС_Доработки
 ```
 
+## Демон ядра
+
+`copilot1c serve` поднимает HTTP API ядра только на `127.0.0.1:8100` — для веба, бота и MCP.
+Секреты (`.env`) и состояние (`.cache`: манифест индекса, кэш OCR) остаются у демона.
+
+```bash
+uv sync --extra server
+uv run copilot1c serve
+curl -s http://127.0.0.1:8100/health   # AI Studio, индекс и манифест, PostgreSQL, платформа 1С
+```
+
+На хосте — служба systemd `deploy/copilot1c-core.service` (пользователь `copilot`, каталог `/opt/1c-copilot`):
+
+```bash
+sudo cp deploy/copilot1c-core.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now copilot1c-core
+journalctl -u copilot1c-core -f
+```
+
 ## Оценка качества
 
 Перед расширением (код 1С, генерация) качество поиска и ответов меряется на эталонных вопросах:

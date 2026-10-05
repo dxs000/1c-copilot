@@ -1,0 +1,25 @@
+[Unit]
+Description=1С Project Copilot — ядро (демон API на 127.0.0.1:8100)
+Documentation=https://github.com/dxs000/1c-copilot
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=copilot
+Group=copilot
+# Настройки (.env), кэш (.cache: манифест индекса, OCR) и материалы (data) — в рабочем каталоге
+WorkingDirectory=/opt/1c-copilot
+ExecStart=/opt/1c-copilot/.venv/bin/copilot1c serve --host 127.0.0.1 --port 8100
+Restart=on-failure
+RestartSec=5
+
+# Ограничения: писать можно только в кэш и папку материалов; порт 8100 — без особых прав
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/1c-copilot/.cache /opt/1c-copilot/data
+
+[Install]
+WantedBy=multi-user.target
