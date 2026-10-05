@@ -16,11 +16,12 @@ def _client(monkeypatch, pg_ok: bool, **kw) -> TestClient:
 
 def test_health_ok_without_platform_1c(monkeypatch, tmp_path):
     (tmp_path / "vector_store").mkdir()
-    (tmp_path / "vector_store" / "vs1.json").write_text("{}")
-    r = _client(monkeypatch, True, cache_dir=str(tmp_path)).get("/health")
+    (tmp_path / "vector_store" / "vs1.json").write_text('{"a": "f1", "b": "f2"}')
+    r = _client(monkeypatch, True, cache_dir=str(tmp_path), ocr_backend="none").get("/health")
     body = r.json()
     assert r.status_code == 200 and body["status"] == "ok"  # платформа 1С необязательна
-    assert body["checks"]["vector_store"]["manifest"] is True
+    assert body["checks"]["vector_store"]["manifest"] is True and body["checks"]["vector_store"]["chunks"] == 2
+    assert body["checks"]["ai_studio"]["model"] and body["checks"]["ocr"]["backend"] == "none"
     assert body["checks"]["platform_1c"] == {"ok": False, "optional": True}
 
 
@@ -63,3 +64,28 @@ def test_ask_errors(monkeypatch):
     monkeypatch.setattr(server, "search_sources", boom)
     r = _ask_client(monkeypatch).post("/ask", json={"question": "Почему не 11.6?"})
     assert r.status_code == 502 and "429" in r.json()["detail"]
+
+
+def test_check_postgres_counts_and_missing_schema(monkeypatch):
+    from copilot1c.graph import store
+
+    class FakeStore:
+        def __init__(self, schema: bool):
+            self.schema = schema
+
+        def query(self, sql, params=()):
+            if "information_schema" in sql:
+                return [{"n": 12 if self.schema else 0}]
+            if not self.schema:
+                raise RuntimeError("relation chunks does not exist")
+            return [{"chunks": 1100, "test_cases": 68, "requirements": 341}]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store, "try_connect", lambda s=None: FakeStore(True))
+    assert server._check_postgres(Settings()) == {"ok": True, "tables": 12, "chunks": 1100, "test_cases": 68,
+                                                  "requirements": 341}
+    monkeypatch.setattr(store, "try_connect", lambda s=None: FakeStore(False))
+    r = server._check_postgres(Settings())
+    assert r["ok"] is True and r["tables"] == 0 and "init-db" in r["detail"]

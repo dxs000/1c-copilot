@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -30,21 +31,39 @@ def _check_postgres(s: Settings) -> dict[str, Any]:
         return {"ok": False, "detail": "нет подключения"}
     try:
         tables = g.query("SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'public'")
-        return {"ok": True, "tables": tables[0]["n"] if tables else 0}
+        out: dict[str, Any] = {"ok": True, "tables": tables[0]["n"] if tables else 0}
+        try:  # счётчики для веба; без схемы (до init-db) — только число таблиц
+            out.update(g.query("SELECT (SELECT count(*) FROM chunks) AS chunks, (SELECT count(*) FROM test_cases) "
+                               "AS test_cases, (SELECT count(*) FROM requirements) AS requirements")[0])
+        except Exception as exc:  # noqa: BLE001
+            out["detail"] = f"схема не создана (copilot1c init-db): {type(exc).__name__}"
+        return out
     except Exception as exc:  # noqa: BLE001 — health не должен падать из-за схемы
         return {"ok": False, "detail": f"{type(exc).__name__}"}
     finally:
         g.close()
 
 
+def _manifest_chunks(path: Path) -> int:
+    try:
+        return len(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return 0
+
+
 def health_report(s: Settings) -> dict[str, Any]:
+    from copilot1c.ingest.ocr import backend
+
     manifest = Path(s.cache_dir or ".cache") / "vector_store" / f"{s.vector_store_id}.json"
+    has_manifest = manifest.exists() if s.vector_store_id else False
     checks = {
-        "ai_studio": {"ok": bool(s.yc_api_key and s.yc_folder_id), "folder": s.yc_folder_id or None},
+        "ai_studio": {"ok": bool(s.yc_api_key and s.yc_folder_id), "folder": s.yc_folder_id or None,
+                      "model": s.model_orchestrator},
         "vector_store": {"ok": bool(s.vector_store_id), "id": s.vector_store_id or None,
-                         "manifest": manifest.exists() if s.vector_store_id else False},
+                         "manifest": has_manifest, "chunks": _manifest_chunks(manifest) if has_manifest else 0},
         "postgres": {**_check_postgres(s), "host": s.pg_dsn.rsplit("@", 1)[-1]},  # без логина и пароля
         "platform_1c": {"ok": Path(s.onec_bin).exists(), "optional": True},
+        "ocr": {"ok": True, "backend": backend(s), "optional": True},
     }
     required_ok = all(checks[k]["ok"] for k in ("ai_studio", "vector_store", "postgres"))
     return {"status": "ok" if required_ok else "degraded", "version": __version__, "project": s.project,
