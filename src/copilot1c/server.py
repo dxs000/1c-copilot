@@ -5,14 +5,18 @@
 
 Методы появляются по шагам; сейчас:
   GET /health — что видит ядро: настройки AI Studio, индекс и его манифест, PostgreSQL, платформа 1С.
+  POST /ask  — вопрос агенту: ответ, найденные фрагменты-источники, шаги агента. Формат ответа совпадает
+               с /api/ask веб-части, чтобы веб проксировал запрос без изменений интерфейса.
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 from copilot1c import __version__
 from copilot1c.config import Settings, get_settings
@@ -47,6 +51,37 @@ def health_report(s: Settings) -> dict[str, Any]:
             "checks": checks}
 
 
+class AskRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=2000)
+
+
+def search_sources(s: Settings, question: str, k: int = 8) -> list[dict[str, Any]]:
+    """Те же фрагменты, что агент получает перед ответом (тот же запрос и тот же поиск ядра)."""
+    from copilot1c.index.yandex import VectorIndex
+    from copilot1c.retrieval import smart_search, source_label
+
+    index = VectorIndex(s.vector_store_id, s)
+    hits = smart_search(lambda q, f, kk: index.search(q, filters=f, k=kk), question, {"project": s.project}, k)
+    out = []
+    for i, h in enumerate(hits, 1):
+        attrs = h.get("attributes") or {}
+        out.append({"n": i, "label": source_label(attrs, h.get("text", "")), "doc_type": attrs.get("doc_type", ""),
+                    "date": attrs.get("date", ""), "text": h.get("text", "")})
+    return out
+
+
+def run_question(s: Settings, question: str):
+    from copilot1c.agent.tools import ToolContext, run_agent
+    from copilot1c.graph.store import try_connect
+
+    store = try_connect(s)
+    try:
+        return run_agent(question, ToolContext(s, s.vector_store_id, Path("data/dumps"), store))
+    finally:
+        if store is not None:
+            store.close()
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="1С Project Copilot — ядро", version=__version__)
     s = settings or get_settings()
@@ -54,5 +89,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, Any]:
         return health_report(s)
+
+    @app.post("/ask")
+    def ask(req: AskRequest) -> dict[str, Any]:
+        # Синхронный обработчик: FastAPI выполняет его в пуле потоков, долгий ответ агента не блокирует /health
+        if not (s.yc_api_key and s.yc_folder_id and s.vector_store_id):
+            raise HTTPException(503, "Не настроены ключи Yandex или COPILOT_VECTOR_STORE_ID в .env ядра")
+        question = req.question.strip()
+        t0 = time.monotonic()
+        try:
+            sources = search_sources(s, question)
+            result = run_question(s, question)
+        except Exception as exc:  # noqa: BLE001 — клиенту причина текстом, а не 500 без объяснения
+            raise HTTPException(502, f"Ошибка обращения к Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
+                from exc
+        return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
+                "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace]}
 
     return app

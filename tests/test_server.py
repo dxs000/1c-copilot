@@ -30,3 +30,36 @@ def test_health_degraded_and_no_secrets(monkeypatch, tmp_path):
     assert body["status"] == "degraded" and body["checks"]["vector_store"]["manifest"] is False
     assert "secret" not in r.text and "AQVN-test-key" not in r.text  # ни пароля БД, ни ключа AI Studio
     assert body["checks"]["postgres"]["host"] == "localhost:5432/copilot"
+
+
+def _ask_client(monkeypatch, **kw):
+    s = Settings(yc_api_key="AQVN-test-key", yc_folder_id="b1g", vector_store_id="vs1", onec_bin="/nonexistent", **kw)
+    return TestClient(server.create_app(s))
+
+
+def test_ask_returns_web_compatible_payload(monkeypatch):
+    from types import SimpleNamespace
+
+    asked = []
+    monkeypatch.setattr(server, "search_sources", lambda s, q, k=8: [
+        {"n": 1, "label": "письмо «Re: ТЗ», 2026-09-15", "doc_type": "email", "date": "2026-09-15", "text": "LTS 11.5.27"}])
+    monkeypatch.setattr(server, "run_question", lambda s, q: asked.append(q) or SimpleNamespace(
+        answer="Нужна LTS 11.5.27", steps=2, trace=[{"tool": "search_docs", "args": "{}"}]))
+    r = _ask_client(monkeypatch).post("/ask", json={"question": "  Почему не 11.6?  "})
+    body = r.json()
+    assert r.status_code == 200 and asked == ["Почему не 11.6?"]
+    assert set(body) == {"answer", "sources", "seconds", "steps", "tools"}  # формат /api/ask веба
+    assert body["sources"][0]["label"].startswith("письмо") and body["tools"] == ["search_docs"] and body["steps"] == 2
+
+
+def test_ask_errors(monkeypatch):
+    c = TestClient(server.create_app(Settings(yc_api_key="", yc_folder_id="", vector_store_id="")))
+    assert c.post("/ask", json={"question": "Почему не 11.6?"}).status_code == 503
+    assert c.post("/ask", json={"question": "?"}).status_code == 422  # слишком короткий вопрос
+
+    def boom(s, q, k=8):
+        raise RuntimeError("429 Too Many Requests")
+
+    monkeypatch.setattr(server, "search_sources", boom)
+    r = _ask_client(monkeypatch).post("/ask", json={"question": "Почему не 11.6?"})
+    assert r.status_code == 502 and "429" in r.json()["detail"]
