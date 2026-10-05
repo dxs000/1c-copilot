@@ -205,4 +205,7 @@ def parse_bytes(data: bytes, filename: str, source: str, known_objects=None, set
 
 def parse_path(path: str | Path, known_objects=None, settings: Settings | None = None):
     path = Path(path)
-    return parse_bytes(path.read_bytes(), clean_filename(path.name), str(path), known_objects, settings)
+    # Источник всегда через «/»: иначе один файл с Windows (data\x.msg) и с Linux (data/x.msg) даёт
+    # разные chunk_id, и повторная индексация на другой ОС заливает в индекс дубли
+    source = path.as_posix().replace("\\", "/")
+    return parse_bytes(path.read_bytes(), clean_filename(path.name), source, known_objects, settings)

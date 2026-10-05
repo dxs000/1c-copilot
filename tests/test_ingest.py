@@ -201,3 +201,20 @@ def test_find_md_objects():
     found = find_md_objects('форма отбора для справочника "номенклатура", регистр сведений «Цены номенклатуры», '
                             "ШтрихкодыНоменклатуры, ПиМИ")
     assert found == ["РегистрСведений «Цены номенклатуры»", "Справочник «Номенклатура»", "ШтрихкодыНоменклатуры"]
+
+
+def test_add_paths_skips_eval_and_dumps_and_uses_posix_sources(tmp_path):
+    data = tmp_path / "data"
+    for rel, text in (("письмо.txt", "Ответ по ДС № 10"), ("Сub/ТЗ.txt", "Пункт 64 плана"),
+                      ("eval/ut11-golden.json", '{"question": "шпаргалка"}'),
+                      ("dumps/УТ11/Module.bsl", "Процедура Тест() КонецПроцедуры")):
+        f = data / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+
+    sources = {c.source for c in Corpus().add_paths([data]).chunks()}
+    assert sources == {(data / "письмо.txt").as_posix(), (data / "Сub" / "ТЗ.txt").as_posix()}
+    assert all("\\" not in s for s in sources)
+
+    explicit = {c.source for c in Corpus().add_paths([data / "eval"]).chunks()}  # явно указанная папка читается
+    assert explicit == {(data / "eval" / "ut11-golden.json").as_posix()}

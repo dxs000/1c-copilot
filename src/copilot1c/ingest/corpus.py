@@ -66,9 +66,11 @@ class Corpus:
     # --- загрузка ---
 
     def add_paths(self, paths: Iterable[str | Path]) -> Corpus:
+        exclude = {d.casefold() for d in (self.settings or get_settings()).ingest_exclude_dirs}
         for p in paths:
             p = Path(p)
-            files = sorted(f for f in p.rglob("*") if f.is_file() and not f.name.startswith(("~$", "."))) \
+            files = sorted(f for f in p.rglob("*") if f.is_file() and not f.name.startswith(("~$", "."))
+                           and not {x.casefold() for x in f.relative_to(p).parts[:-1]} & exclude) \
                 if p.is_dir() else [p]
             for f in files:
                 self._add_results(parse_path(f, self.known_objects, self.settings), context=None)
