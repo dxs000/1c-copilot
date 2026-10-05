@@ -183,6 +183,19 @@ def ask(question: str, vector_store: str | None = typer.Option(None, help="По 
             g.close()
 
 
+@app.command("serve")
+def serve(host: str = typer.Option("127.0.0.1", help="Только localhost: наружу ядро не выставляется"),
+          port: int = typer.Option(8100)):
+    """Запустить демон ядра: HTTP API для веба, бота и MCP (под systemd — сервис copilot1c-core)."""
+    try:
+        import uvicorn
+
+        from copilot1c.server import create_app
+    except ImportError as exc:
+        raise typer.BadParameter("Нужны зависимости демона: uv sync --extra server") from exc
+    uvicorn.run(create_app(), host=host, port=port, log_level="info")
+
+
 @app.command("eval")
 def eval_cmd(golden: Path = typer.Argument(..., help="JSON с эталонными вопросами (см. tests/eval/example.json)"),
              answers: bool = typer.Option(False, help="Проверять и ответы агента (дольше и дороже)"),
