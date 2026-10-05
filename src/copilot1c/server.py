@@ -7,6 +7,8 @@
   GET /health — что видит ядро: настройки AI Studio, индекс и его манифест, PostgreSQL, платформа 1С.
   POST /ask  — вопрос агенту: ответ, найденные фрагменты-источники, шаги агента. Формат ответа совпадает
                с /api/ask веб-части, чтобы веб проксировал запрос без изменений интерфейса.
+  POST /materials — загрузить файлы (multipart, поле files): сохраняются в data/uploads, попадают в реестр.
+  GET  /materials, GET /materials/{id} — реестр загруженных материалов и их статусы.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from copilot1c import __version__
@@ -101,6 +103,17 @@ def run_question(s: Settings, question: str):
             store.close()
 
 
+def _registry(s: Settings):
+    """Подключение к PostgreSQL и реестр материалов; 503, если базы нет."""
+    from copilot1c.graph.store import try_connect
+    from copilot1c.materials import MaterialRegistry
+
+    g = try_connect(s)
+    if g is None:
+        raise HTTPException(503, "PostgreSQL недоступен — реестр материалов не работает")
+    return g, MaterialRegistry(g.conn, s.project)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="1С Project Copilot — ядро", version=__version__)
     s = settings or get_settings()
@@ -124,5 +137,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace]}
+
+    @app.post("/materials")
+    def upload(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+        from copilot1c.materials import MAX_UPLOAD_BYTES, register_upload, row_out
+
+        root = Path(s.materials_dir)
+        g, reg = _registry(s)
+        out = []
+        try:
+            for f in files:
+                data = f.file.read(MAX_UPLOAD_BYTES + 1)
+                name = f.filename or "файл"
+                if len(data) > MAX_UPLOAD_BYTES:
+                    out.append({"filename": name, "error": f"файл больше {MAX_UPLOAD_BYTES // 2**20} МБ — не сохранён"})
+                    continue
+                if not data:
+                    out.append({"filename": name, "error": "пустой файл — не сохранён"})
+                    continue
+                row, seen = register_upload(reg, root, name, data, base=Path.cwd())
+                out.append({**row_out(row), "already_uploaded": seen})
+        finally:
+            g.close()
+        return {"materials": out}
+
+    @app.get("/materials")
+    def materials(limit: int = 200) -> dict[str, Any]:
+        from copilot1c.materials import row_out
+
+        g, reg = _registry(s)
+        try:
+            return {"materials": [row_out(r) for r in reg.list(min(max(limit, 1), 1000))]}
+        finally:
+            g.close()
+
+    @app.get("/materials/{material_id}")
+    def material(material_id: int) -> dict[str, Any]:
+        from copilot1c.materials import row_out
+
+        g, reg = _registry(s)
+        try:
+            row = reg.get(material_id)
+        finally:
+            g.close()
+        if row is None:
+            raise HTTPException(404, "Материал не найден")
+        return row_out(row)
 
     return app

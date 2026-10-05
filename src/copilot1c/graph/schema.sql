@@ -133,3 +133,22 @@ CREATE OR REPLACE VIEW uncovered_requirements AS
 SELECT r.* FROM requirements r
 LEFT JOIN requirement_tests rt USING (project, req_id, doc)
 WHERE rt.test_num IS NULL;
+
+-- Материалы, загруженные через веб: файл, его путь в data/uploads и судьба в конвейере
+-- (в очереди → разбор → индексация → запись в базу → готово | уже есть | ошибка)
+CREATE TABLE IF NOT EXISTS materials (
+    id           bigserial PRIMARY KEY,
+    project      text NOT NULL,
+    filename     text NOT NULL,          -- имя, как его загрузили
+    path         text NOT NULL,          -- путь относительно рабочего каталога ядра
+    sha256       text NOT NULL,
+    size         bigint NOT NULL,
+    status       text NOT NULL DEFAULT 'queued',
+    detail       text,                   -- что сейчас происходит или причина ошибки
+    report       jsonb NOT NULL DEFAULT '{}',
+    uploaded_at  timestamptz NOT NULL DEFAULT now(),
+    started_at   timestamptz,
+    finished_at  timestamptz,
+    UNIQUE (project, sha256)
+);
+CREATE INDEX IF NOT EXISTS materials_status_idx ON materials (status, id);
