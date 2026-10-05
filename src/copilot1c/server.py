@@ -8,7 +8,8 @@
   POST /ask  — вопрос агенту: ответ, найденные фрагменты-источники, шаги агента. Формат ответа совпадает
                с /api/ask веб-части, чтобы веб проксировал запрос без изменений интерфейса.
   POST /materials — загрузить файлы (multipart, поле files): сохраняются в data/uploads, попадают в реестр.
-  GET  /materials, GET /materials/{id} — реестр загруженных материалов и их статусы.
+  GET  /materials, GET /materials/{id} — реестр загруженных материалов и их статусы. Обработку
+               (разбор → индексация → запись в базу) ведёт фоновый поток, см. worker.py.
 """
 
 from __future__ import annotations
@@ -114,13 +115,31 @@ def _registry(s: Settings):
     return g, MaterialRegistry(g.conn, s.project)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    app = FastAPI(title="1С Project Copilot — ядро", version=__version__)
+def create_app(settings: Settings | None = None, start_worker: bool = False) -> FastAPI:
+    """start_worker — запустить фоновую обработку загруженных материалов (так делает copilot1c serve)."""
+    from contextlib import asynccontextmanager
+
+    from copilot1c.worker import MaterialWorker
+
     s = settings or get_settings()
+    worker = MaterialWorker(s)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if start_worker:
+            worker.start()
+        yield
+        if worker.running:
+            worker.stop()
+
+    app = FastAPI(title="1С Project Copilot — ядро", version=__version__, lifespan=lifespan)
+    app.state.worker = worker
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return health_report(s)
+        report = health_report(s)
+        report["checks"]["materials_worker"] = {"ok": worker.running, "busy": worker.busy, "optional": True}
+        return report
 
     @app.post("/ask")
     def ask(req: AskRequest) -> dict[str, Any]:

@@ -193,7 +193,10 @@ def serve(host: str = typer.Option("127.0.0.1", help="Только localhost: н
         from copilot1c.server import create_app
     except ImportError as exc:
         raise typer.BadParameter("Нужны зависимости демона: uv sync --extra server") from exc
-    uvicorn.run(create_app(), host=host, port=port, log_level="info")
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")
+    uvicorn.run(create_app(start_worker=True), host=host, port=port, log_level="info")
 
 
 @app.command("eval")
