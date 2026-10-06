@@ -181,3 +181,30 @@ def test_issues_without_postgres_is_503(monkeypatch):
     c = TestClient(server.create_app(Settings()))
     assert c.get("/issues").status_code == 503
     assert c.get("/issues/meta").status_code == 200  # справочники не требуют базы
+
+
+@needs_pg
+def test_nul_and_control_chars_are_removed(client):
+    # в письмах Outlook (.msg) бывает NUL — PostgreSQL его не принимает, раньше это давало HTTP 500
+    r = client.post("/issues", json={"title": "Бланк\x00 заказа", "description": "Дмитрий,\x00\n\tБланк\x07 не грузится",
+                                     "objects": ["Документ.Заказ\x00"]})
+    assert r.status_code == 200, r.text
+    issue = r.json()
+    assert issue["title"] == "Бланк заказа" and issue["description"] == "Дмитрий,\n\tБланк не грузится"
+    assert issue["objects"] == ["Документ.Заказ"]
+    assert client.post(f"/issues/{issue['id']}/comments", json={"text": "ок\x00"}).status_code == 200
+    c = client.post("/contacts", json={"name": "Иванов\x00 Иван", "email": "i@pierre-fabre.com\x00",
+                                       "position": "бухгалтер\x00"}).json()
+    assert c["name"] == "Иванов Иван" and c["email"] == "i@pierre-fabre.com" and c["position"] == "бухгалтер"
+
+
+def test_unexpected_error_has_text_detail(monkeypatch):
+    from copilot1c.graph import store
+
+    def broken(s=None):
+        raise RuntimeError("что-то сломалось")
+
+    monkeypatch.setattr(store, "try_connect", broken)
+    c = TestClient(server.create_app(Settings()), raise_server_exceptions=False)
+    r = c.get("/issues")
+    assert r.status_code == 500 and "RuntimeError: что-то сломалось" in r.json()["detail"]

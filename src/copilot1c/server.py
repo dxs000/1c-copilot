@@ -229,6 +229,18 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
     app = FastAPI(title="1С Project Copilot — ядро", version=__version__, lifespan=lifespan)
     app.state.worker = worker
 
+    @app.exception_handler(Exception)
+    async def unexpected(request, exc: Exception):
+        """Непредвиденная ошибка: трассировка — в журнал службы, клиенту — причина текстом вместо голого 500."""
+        import logging
+
+        from fastapi.responses import JSONResponse
+
+        logging.getLogger("copilot1c.server").exception("%s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={
+            "detail": f"Внутренняя ошибка ядра: {type(exc).__name__}: {str(exc)[:300]} "
+                      "(подробности: journalctl -u copilot1c-core)"})
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         report = health_report(s)

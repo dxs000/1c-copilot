@@ -96,7 +96,11 @@ def _as_aware(d: datetime | None, tz) -> datetime | None:
 
 def _letter(out: list[ChainMessage], files: list[tuple[str, bytes]], *, subject: str, sender: str, date,
             body: str, message_id: str | None, origin: str) -> None:
-    """Письмо-файл и его цитаты — в цепочку."""
+    """Письмо-файл и его цитаты — в цепочку. Управляющие символы (NUL из свойств MAPI) убираются сразу."""
+    from copilot1c.issues import text_safe
+
+    subject, sender, body = text_safe(subject or ""), text_safe(sender or ""), text_safe(body or "")
+    message_id = text_safe(message_id) if message_id else None
     tz = date.tzinfo if date else None
     own, quoted = split_thread(body or "", tz)
     name, addr = split_address(sender or "")

@@ -128,15 +128,24 @@ def _clean(changes: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in changes.items():
         if isinstance(v, str):
-            v = v.strip() or None
+            v = text_safe(v).strip() or None
         if k in _ARRAYS:
-            v = list(dict.fromkeys(str(x).strip() for x in (v or []) if str(x).strip()))
+            v = list(dict.fromkeys(text_safe(str(x)).strip() for x in (v or []) if text_safe(str(x)).strip()))
         if k in _CHOICES and v not in _CHOICES[k]:
             raise IssueError(f"Неизвестное значение {k}: {v!r}; допустимо: {', '.join(_CHOICES[k])}")
         if k == "title" and not v:
             raise IssueError("Тема обращения не может быть пустой")
         out[k] = v
     return out
+
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def text_safe(v: Any) -> Any:
+    """Строка без управляющих символов. PostgreSQL не принимает NUL (\\x00) в text и jsonb, а в письмах
+    Outlook (.msg) он встречается — хвосты строк свойств MAPI. Перевод строки и табуляция остаются."""
+    return _CONTROL.sub("", v) if isinstance(v, str) else v
 
 
 def parse_number(text: str) -> int | None:
@@ -312,7 +321,8 @@ class IssueRegistry:
         return self.get(issue_id)
 
     def add_comment(self, issue_id: int, text: str, actor: str | None = None) -> dict[str, Any] | None:
-        if not (text or "").strip():
+        text = text_safe(text or "")
+        if not text.strip():
             raise IssueError("Пустой комментарий")
         with self.conn.cursor() as cur:
             cur.execute("UPDATE issues SET updated_at = now() WHERE project = %s AND id = %s RETURNING id",
@@ -386,12 +396,12 @@ class IssueRegistry:
                        position: str | None = None, phone: str | None = None) -> dict[str, Any]:
         """Контакт по e-mail: если уже есть — обновляются пустые поля и last_seen, иначе создаётся.
         Без e-mail контакт создаётся всегда (сопоставлять по имени ненадёжно)."""
-        name = (name or "").strip()
-        email = (email or "").strip().lower() or None
+        name = text_safe(name or "").strip()
+        email = text_safe(email or "").strip().lower() or None
         if not name and not email:
             raise IssueError("У контакта должно быть имя или e-mail")
         vals = {"organization": organization, "position": position, "phone": phone}
-        vals = {k: (v.strip() or None) if isinstance(v, str) else v for k, v in vals.items()}
+        vals = {k: (text_safe(v).strip() or None) if isinstance(v, str) else v for k, v in vals.items()}
         with self.conn.cursor(row_factory=dict_row) as cur:
             if email:
                 cur.execute("SELECT * FROM contacts WHERE lower(email) = %s", (email,))

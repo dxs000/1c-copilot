@@ -208,3 +208,13 @@ def test_attach_email_with_expand(client):
     assert r[1]["from_email"] == "fw.eml" and r[1]["mime"] == "image/png"
     plain = client.post(f"/issues/{iid}/attachments", files=[("files", ("x.eml", forwarded_quoted(), "x"))]).json()
     assert len(plain["attachments"]) == 1  # без expand — только само письмо
+
+
+def test_nul_in_letter_is_removed():
+    m = MimeMessage()
+    m["Subject"] = "Бланк заказа на доработку КС"
+    m["From"] = "Smirnova Maria <m.smirnova@pierre-fabre.com>"
+    m["Date"] = "Mon, 05 Oct 2026 10:15:00 +0300"
+    m.set_content("Дмитрий,\x00\n\nБланк не грузится в 1С\x00")
+    p = ei.proposal("x.eml", analyze(bytes(m)))
+    assert "\x00" not in p["draft"]["description"] and p["draft"]["description"].startswith("Дмитрий,")
