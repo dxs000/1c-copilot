@@ -199,6 +199,19 @@ def serve(host: str = typer.Option("127.0.0.1", help="Только localhost: н
     uvicorn.run(create_app(start_worker=True), host=host, port=port, log_level="info")
 
 
+@app.command("classify")
+def classify_cmd(text: str, llm: bool = typer.Option(True, help="Уточнять моделью, если эвристики не уверены")):
+    """Тип сообщения чата, как его видит ядро: эвристики, вызов модели (COPILOT_MODEL_BATCH), черновик обращения."""
+    import json as _json
+
+    from copilot1c.intent import classify, issue_draft
+
+    r = classify(text, settings=get_settings(), use_llm=llm)
+    typer.echo(_json.dumps(r.to_dict(), ensure_ascii=False, indent=2))
+    if r.is_issue:
+        typer.echo("Черновик обращения:\n" + _json.dumps(issue_draft(text), ensure_ascii=False, indent=2))
+
+
 @app.command("web-search")
 def web_search_cmd(query: str, sites: list[str] = typer.Option(None, "--site", help="Ограничить сайтом (можно несколько)"),
                    read: bool = typer.Option(False, help="Прочитать первую найденную страницу")):

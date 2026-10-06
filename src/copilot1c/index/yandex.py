@@ -42,9 +42,44 @@ def embed(texts: Sequence[str], *, query: bool = False, settings: Settings | Non
     return out
 
 
+def strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Схема в строгом виде, который требует AI Studio («Invalid JSON Schema: all fields must be required»):
+    в каждом объекте все поля перечислены в required и лишние запрещены; поле, которое было необязательным,
+    допускает null — модель оставляет его пустым, а не выдумывает. Исходная схема не меняется."""
+    if not isinstance(schema, dict):
+        return schema
+    out = {k: v for k, v in schema.items() if k not in ("properties", "items")}
+    if "items" in schema:
+        out["items"] = strict_schema(schema["items"])
+    if schema.get("type") == "object" and "properties" in schema:
+        required = set(schema.get("required") or [])
+        props = {}
+        for name, sub in schema["properties"].items():
+            sub = strict_schema(sub)
+            if name not in required:
+                sub = _nullable(sub)
+            props[name] = sub
+        out["properties"] = props
+        out["required"] = list(props)
+        out["additionalProperties"] = False
+    return out
+
+
+def _nullable(sub: dict[str, Any]) -> dict[str, Any]:
+    t = sub.get("type")
+    if isinstance(t, str) and t != "null":
+        sub = {**sub, "type": [t, "null"]}
+        if "enum" in sub:
+            sub["enum"] = [*sub["enum"], None]
+    elif isinstance(t, list) and "null" not in t:
+        sub = {**sub, "type": [*t, "null"]}
+    return sub
+
+
 def chat_json(prompt: str, schema: dict[str, Any], *, model: str, system: str = "",
               settings: Settings | None = None) -> dict[str, Any]:
-    """Вызов модели со structured output по JSON-схеме."""
+    """Вызов модели со structured output по JSON-схеме (схема приводится к строгому виду, см. strict_schema).
+    Пустые (null) необязательные поля из ответа убираются — вызывающий код видит их как отсутствующие."""
     s = settings or get_settings()
     messages = [{"role": "system", "content": system}] if system else []
     messages.append({"role": "user", "content": prompt})
@@ -52,9 +87,18 @@ def chat_json(prompt: str, schema: dict[str, Any], *, model: str, system: str = 
         model=s.model_uri(model),
         messages=messages,
         temperature=0,
-        response_format={"type": "json_schema", "json_schema": {"name": "result", "schema": schema}},
+        response_format={"type": "json_schema",
+                         "json_schema": {"name": "result", "schema": strict_schema(schema)}},
     )
-    return json.loads(resp.choices[0].message.content or "{}")
+    return _drop_nulls(json.loads(resp.choices[0].message.content or "{}"))
+
+
+def _drop_nulls(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_nulls(v) for v in value]
+    return value
 
 
 class VectorIndex:
