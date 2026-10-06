@@ -34,7 +34,8 @@ def test_health_degraded_and_no_secrets(monkeypatch, tmp_path):
 
 
 def _ask_client(monkeypatch, **kw):
-    s = Settings(yc_api_key="AQVN-test-key", yc_folder_id="b1g", vector_store_id="vs1", onec_bin="/nonexistent", **kw)
+    s = Settings(yc_api_key="AQVN-test-key", yc_folder_id="b1g", vector_store_id="vs1", onec_bin="/nonexistent",
+                 intent_llm=False, **kw)  # без вызова модели для типа сообщения
     return TestClient(server.create_app(s))
 
 
@@ -49,7 +50,9 @@ def test_ask_returns_web_compatible_payload(monkeypatch):
     r = _ask_client(monkeypatch).post("/ask", json={"question": "  Почему не 11.6?  "})
     body = r.json()
     assert r.status_code == 200 and asked == ["Почему не 11.6?"]
-    assert set(body) == {"answer", "sources", "seconds", "steps", "tools"}  # формат /api/ask веба
+    # формат /api/ask веба + тип сообщения и черновик обращения (для вопроса — пусто)
+    assert set(body) == {"answer", "sources", "seconds", "steps", "tools", "intent", "issue_draft"}
+    assert body["intent"]["primary"] == "question" and body["issue_draft"] is None
     assert body["sources"][0]["label"].startswith("письмо") and body["tools"] == ["search_docs"] and body["steps"] == 2
 
 

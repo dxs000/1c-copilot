@@ -6,7 +6,10 @@
 Методы появляются по шагам; сейчас:
   GET /health — что видит ядро: настройки AI Studio, индекс и его манифест, PostgreSQL, платформа 1С.
   POST /ask  — вопрос агенту: ответ, найденные фрагменты-источники, шаги агента. Формат ответа совпадает
-               с /api/ask веб-части, чтобы веб проксировал запрос без изменений интерфейса.
+               с /api/ask веб-части, чтобы веб проксировал запрос без изменений интерфейса. Плюс intent — тип
+               сообщения (вопрос, проблема, сводка, документ, знание) и issue_draft — черновик обращения, если
+               это сообщение о проблеме (intent.py; ничего не сохраняется).
+  POST /classify — только тип сообщения и черновик обращения, без агента.
   POST /materials — загрузить файлы (multipart, поле files): сохраняются в data/uploads, попадают в реестр.
   GET  /materials, GET /materials/{id} — реестр загруженных материалов и их статусы. Обработку
                (разбор → индексация → запись в базу) ведёт фоновый поток, см. worker.py.
@@ -104,6 +107,26 @@ def health_report(s: Settings) -> dict[str, Any]:
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=2000)
+
+
+class ClassifyRequest(BaseModel):
+    text: str = Field(min_length=2, max_length=20000)
+    has_files: bool = False
+    use_llm: bool = True
+
+
+def classify_message(s: Settings, text: str, has_files: bool = False, use_llm: bool = True) -> dict[str, Any]:
+    """Тип сообщения и, для проблемы, черновик обращения. Ошибка классификатора не ломает ответ агенту."""
+    from copilot1c.intent import classify, issue_draft
+
+    try:
+        intent = classify(text, has_files, settings=s, use_llm=use_llm)
+    except Exception as exc:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("copilot1c.intent").exception("классификация сообщения")
+        return {"intent": {"primary": "question", "error": f"{type(exc).__name__}: {exc}"[:300]}, "issue_draft": None}
+    return {"intent": intent.to_dict(), "issue_draft": issue_draft(text) if intent.is_issue else None}
 
 
 def search_sources(s: Settings, question: str, k: int = 8) -> list[dict[str, Any]]:
@@ -270,6 +293,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             raise HTTPException(503, "Не настроены ключи Yandex или COPILOT_VECTOR_STORE_ID в .env ядра")
         question = req.question.strip()
         t0 = time.monotonic()
+        kind = classify_message(s, question)
         try:
             sources = search_sources(s, question)
             result = run_question(s, question)
@@ -277,7 +301,11 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             raise HTTPException(502, f"Ошибка обращения к Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
-                "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace]}
+                "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind}
+
+    @app.post("/classify")
+    def classify_endpoint(req: ClassifyRequest) -> dict[str, Any]:
+        return classify_message(s, req.text.strip(), req.has_files, req.use_llm)
 
     @app.post("/materials")
     def upload(files: list[UploadFile] = File(...)) -> dict[str, Any]:

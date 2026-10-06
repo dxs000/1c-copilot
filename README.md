@@ -55,6 +55,7 @@ RAG-системы для 1С на Yandex Cloud AI».
 | `agent/tools.py` | Инструменты агента и цикл function calling |
 | `issues.py` | Обращения, контакты-инициаторы, вложения и история |
 | `email_intake.py` | Письмо → черновик обращения: цепочка, инициатор, подпись, файлы |
+| `intent.py` | Тип сообщения в чате (эвристики + модель) и черновик обращения из текста |
 
 ## Быстрый старт
 
@@ -119,8 +120,13 @@ journalctl -u copilot1c-core -f
 
 Методы демона: `GET /issues/meta`, `GET|POST /issues`, `GET|PATCH /issues/{id}`,
 `POST /issues/{id}/comments`, `POST /issues/{id}/attachments`, `GET /issues/{id}/attachments/{aid}`,
-`GET|POST /contacts`. Список аналитиков — `COPILOT_ANALYSTS` в `.env` (JSON-список).
+`GET|POST /contacts`, `POST /classify`. Список аналитиков — `COPILOT_ANALYSTS` в `.env` (JSON-список).
 После обновления ядра таблицы создаются командой `copilot1c init-db` (существующие данные не трогаются).
+
+Тип сообщения в чате (`intent.py`): `POST /ask` кроме ответа агента возвращает `intent` — вопрос,
+проблема, сводка, документ или новое знание (с баллами и сигналами, почему так) — и `issue_draft`,
+если это сообщение о проблеме: тема, описание, текст ошибки 1С, объекты, категория, приоритет.
+Решают эвристики; спорные случаи — модель (`COPILOT_INTENT_LLM`). `POST /classify` — то же без агента.
 
 Разбор письма в обращение (`email_intake.py`, `POST /issues/from-email`): из .msg/.eml собирается
 вся цепочка (само письмо, цитаты, письма-вложения), инициатор — последний автор из своих доменов
