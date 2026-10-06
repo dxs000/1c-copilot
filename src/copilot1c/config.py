@@ -1,9 +1,15 @@
 """Настройки из переменных окружения (префикс COPILOT_) и файла .env."""
 
+import json
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# Список в .env можно задать JSON-ом (["a", "b"]) или через запятую (a, b) — второе привычнее и не роняет
+# демон, если кавычки забыли
+StrList = Annotated[tuple[str, ...], NoDecode]
 
 
 class Settings(BaseSettings):
@@ -45,7 +51,11 @@ class Settings(BaseSettings):
     # Аналитики интегратора — для полей «кто завёл» и «ответственный» (в .env JSON-списком:
     # COPILOT_ANALYSTS='["Иванов И.", "Петрова А."]'); пустой список — имя вводится вручную.
     issues_dir: str = "issues"
-    analysts: tuple[str, ...] = ()
+    analysts: StrList = ()
+    # Разбор письма в обращение: свои домены (аналитики и инициаторы — сотрудники одной организации) и
+    # адреса аналитиков. Инициатор — последний автор цепочки из своих доменов, который не аналитик.
+    internal_domains: StrList = ()
+    analyst_emails: StrList = ()
     # Конвертация старых форматов (.doc, .xls, .rtf, .odt) через LibreOffice
     soffice_bin: str = "soffice"
 
@@ -56,6 +66,15 @@ class Settings(BaseSettings):
 
     # Префиксы доработок интегратора: по ним отделяются нетиповые объекты
     custom_prefixes: tuple[str, ...] = ("КС_", "(КС)")
+
+    @field_validator("analysts", "internal_domains", "analyst_emails", mode="before")
+    @classmethod
+    def _str_list(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            items = json.loads(v) if v.startswith("[") else v.replace(";", ",").split(",")
+            return tuple(str(x).strip() for x in items if str(x).strip())
+        return v
 
     def model_uri(self, name: str) -> str:
         return f"gpt://{self.yc_folder_id}/{name}"

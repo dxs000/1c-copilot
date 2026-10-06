@@ -17,6 +17,9 @@
   PATCH /issues/{id} — правка полей с версией (409 при одновременной правке) и комментарием;
   POST  /issues/{id}/comments, POST /issues/{id}/attachments (multipart files),
   GET   /issues/{id}/attachments/{aid} — файл вложения;
+  POST  /issues/from-email — разбор письма (.msg/.eml) в черновик: инициатор, дата, тема, текст, цепочка;
+        ничего не сохраняет. POST /issues/{id}/attachments с expand=true — письмо прикрепляется вместе
+        с файлами, вложенными в него (скриншоты, логи);
   GET   /contacts?q=, POST /contacts — инициаторы обращений (сотрудники заказчика).
 """
 
@@ -187,6 +190,12 @@ class ContactIn(BaseModel):
     organization: str | None = None
     position: str | None = None
     phone: str | None = None
+
+
+def iss_number(issue_id: int) -> str:
+    from copilot1c.issues import number
+
+    return number(issue_id)
 
 
 def _issues(s: Settings):
@@ -362,13 +371,56 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             raise HTTPException(404, "Обращение не найдено")
         return issue
 
+    @app.post("/issues/from-email")
+    def issues_from_email(file: UploadFile = File(...)) -> dict[str, Any]:
+        """Разбор письма в черновик обращения. Ничего не сохраняет: аналитик проверяет и сохраняет сам."""
+        from copilot1c.email_intake import analyze, is_email_file, proposal
+        from copilot1c.materials import MAX_UPLOAD_BYTES
+
+        name = file.filename or "письмо"
+        if not is_email_file(name):
+            raise HTTPException(422, "Нужен файл письма .msg или .eml")
+        data = file.file.read(MAX_UPLOAD_BYTES + 1)
+        if not data or len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(422, "Файл пустой или слишком большой")
+        try:
+            intake = analyze(name, data, s.internal_domains, s.analyst_emails, s.analysts)
+        except Exception as exc:  # noqa: BLE001 — битый файл: причина текстом
+            raise HTTPException(422, f"Не удалось разобрать письмо: {type(exc).__name__}: {str(exc)[:200]}") from exc
+        out = proposal(name, intake)
+        out["contact"] = None
+        out["already_registered"] = None
+        g, reg = _issues(s)
+        try:
+            if out["initiator"]:
+                out["contact"] = reg.contact_by_email(out["initiator"]["email"])
+            key = out["draft"].get("source_message_id")
+            row = reg.find_by_message_id(key) if key else None
+            if row is not None:
+                out["already_registered"] = {"id": row["id"], "number": iss_number(row["id"]), "title": row["title"]}
+        finally:
+            g.close()
+        if not s.internal_domains:
+            out["reason"] += " (не задан COPILOT_INTERNAL_DOMAINS — свои домены неизвестны)"
+        return out
+
     @app.post("/issues/{issue_id}/attachments")
-    def issues_attach(issue_id: int, files: list[UploadFile] = File(...),
-                      actor: str | None = Form(None)) -> dict[str, Any]:
+    def issues_attach(issue_id: int, files: list[UploadFile] = File(...), actor: str | None = Form(None),
+                      expand: bool = Form(False)) -> dict[str, Any]:
+        """expand — для писем .msg/.eml прикрепить ещё и вложенные в них файлы (скриншоты, логи)."""
+        from copilot1c.email_intake import is_email_file, read_chain
         from copilot1c.materials import MAX_UPLOAD_BYTES
 
         g, reg = _issues(s)
         out = []
+
+        def attach(name: str, data: bytes, inner_of: str | None = None) -> None:
+            res = reg.add_attachment(issue_id, name, data, actor)
+            if res is None:
+                raise HTTPException(404, "Обращение не найдено")
+            att, seen = res
+            out.append({**att, "already_attached": seen, **({"from_email": inner_of} if inner_of else {})})
+
         try:
             for f in files:
                 data = f.file.read(MAX_UPLOAD_BYTES + 1)
@@ -379,11 +431,15 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 if not data:
                     out.append({"filename": name, "error": "пустой файл — не сохранён"})
                     continue
-                res = reg.add_attachment(issue_id, name, data, actor)
-                if res is None:
-                    raise HTTPException(404, "Обращение не найдено")
-                att, seen = res
-                out.append({**att, "already_attached": seen})
+                attach(name, data)
+                if expand and is_email_file(name):
+                    try:
+                        inner = read_chain(name, data)[1]
+                    except Exception as exc:  # noqa: BLE001 — письмо сохранено, разобрать вложения не вышло
+                        out.append({"filename": name, "error": f"вложения письма не извлечены: {type(exc).__name__}"})
+                        continue
+                    for inner_name, inner_data in inner:
+                        attach(inner_name, inner_data, name)
         finally:
             g.close()
         return {"attachments": out}

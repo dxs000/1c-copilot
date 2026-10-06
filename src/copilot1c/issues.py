@@ -367,6 +367,13 @@ class IssueRegistry:
 
     # ---------- контакты ----------
 
+    def contact_by_email(self, email: str | None) -> dict[str, Any] | None:
+        if not email:
+            return None
+        row = self._one("SELECT * FROM contacts WHERE lower(email) = %s", (email.strip().lower(),))
+        self.conn.commit()
+        return _out(row) if row else None
+
     def contacts(self, q: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         like = f"%{(q or '').strip()}%"
         rows = self._all("SELECT * FROM contacts WHERE name ILIKE %s OR coalesce(email, '') ILIKE %s "
