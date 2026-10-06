@@ -369,7 +369,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
-                "web_sources": getattr(result, "web_sources", []), "escalation": getattr(result, "escalation", None)}
+                "web_sources": getattr(result, "web_sources", []), "escalation": getattr(result, "escalation", None),
+                "issues": getattr(result, "issues", [])}
 
     @app.post("/ask/files")
     def ask_files(question: str = Form(..., min_length=2, max_length=2000),
@@ -407,7 +408,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
                 "attachments": [it.out() for it in items], "web_sources": getattr(result, "web_sources", []),
-                "escalation": getattr(result, "escalation", None)}
+                "escalation": getattr(result, "escalation", None), "issues": getattr(result, "issues", [])}
 
     @app.post("/escalations")
     def escalation_create(payload: str = Form("{}"), files: list[UploadFile] | None = File(None)) -> dict[str, Any]:

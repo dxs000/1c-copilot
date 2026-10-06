@@ -32,6 +32,12 @@ SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта
 не повторяй один и тот же запрос. Аналитические вопросы («что не покрыто», «что затронет
 обновление») решай в несколько шагов: поиск → граф → SQL.
 
+Обращения. База зарегистрированных проблем доступна: get_issue — по номеру (ОБР-0012 или 12),
+search_issues — по смыслу. Если в сообщении уже есть блок «Похожие зарегистрированные обращения» или
+вопрос описывает проблему — проверь, не зарегистрирована ли она: назови номер, статус и что по ней известно
+(«это похоже на ОБР-0012, статус «в работе»»), если есть решение — опирайся на него. Новое обращение
+предлагает интерфейс; ты не регистрируй и не утверждай, что зарегистрировал.
+
 Интернет (web_search, read_page) — только после базы проекта и только если ответа там нет, а вопрос
 про платформу 1С, типовую конфигурацию, текст ошибки, версии, методику — то, что известно вне проекта.
 Договорённости, сроки, переписку и ТЗ проекта в интернете не ищи — их там нет. Запрос в интернет
@@ -77,6 +83,11 @@ TOOLS = [
         {"base": _STR, "target": _STR, "path": _STR}, ["base", "target"]),
     _fn("sql", "SELECT-запрос только на чтение к реестрам: test_cases, requirements, md_objects, "
         "bsl_methods, bsl_calls, uncovered_requirements, custom_objects.", {"query": _STR}, ["query"]),
+    _fn("get_issue", "Обращение (зарегистрированная проблема) по номеру: суть, текст ошибки, статус, причина, решение, "
+        "связи, комментарии.", {"number": {"type": "string", "description": "ОБР-0012 или 12"}}, ["number"]),
+    _fn("search_issues", "Поиск среди зарегистрированных обращений: по смыслу, тексту ошибки 1С, объектам, теме, "
+        "инициатору. Для проверки дублей и поиска решённых похожих проблем.",
+        {"query": _STR, "open_only": {"type": "boolean", "description": "Только незакрытые"}}, ["query"]),
     _fn("web_search", "Поиск в интернете (Yandex). Только когда в базе проекта ответа нет и вопрос про платформу, "
         "типовую конфигурацию, ошибку, версии. Запрос — без имён, контактов, серверов и названия заказчика.",
         {"query": {"type": "string", "description": "Текст ошибки, объекты 1С, версии, общие слова"},
@@ -105,6 +116,7 @@ class ToolContext:
     web_searches: int = 0
     web_pages: int = 0
     escalation: dict | None = None  # рекомендация агента передать вопрос эксперту
+    issues: list[dict] = field(default_factory=list)  # обращения, показанные агенту (упомянутые и похожие)
 
 
 def _raw_search(ctx: ToolContext) -> Callable[[str, dict, int], list[dict]]:
@@ -196,6 +208,18 @@ def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
                                     "domain": page["url"].split("/")[2], "read": True})
         return {**page, "источник": f"интернет: {page['title'] or page['url']} — {page['url']}"}
 
+    def get_issue(number: str):
+        from copilot1c.agent.issues_tools import get_issue as fetch
+
+        assert ctx.store, "PostgreSQL недоступен"
+        return fetch(ctx.store.conn, project, number)
+
+    def search_issues(query: str, open_only: bool = False):
+        from copilot1c.agent.issues_tools import search_issues as find
+
+        assert ctx.store, "PostgreSQL недоступен"
+        return find(ctx.store.conn, project, query, open_only) or {"result": "похожих обращений нет"}
+
     def prepare_escalation(reason: str, expert_question: str):
         ctx.escalation = {"reason": (reason or "").strip()[:2000], "expert_question": (expert_question or "").strip()[:4000]}
         return {"ok": True, "note": "Аналитику будет предложено собрать пакет для эксперта. Дай в ответе то, что "
@@ -207,7 +231,8 @@ def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
         return [{"step": r.argv[r.argv.index("/Out") + 2], "ok": r.ok, "log": r.log[-4000:]} for r in results]
 
     return {f.__name__: f for f in (search_docs, search_code, graph_query, get_module, diff_versions, sql,
-                                     web_search, read_page, prepare_escalation, build_and_check)}
+                                     get_issue, search_issues, web_search, read_page, prepare_escalation,
+                                     build_and_check)}
 
 
 @dataclass
@@ -217,12 +242,13 @@ class AgentResult:
     steps: int
     web_sources: list[dict] = field(default_factory=list)  # найденное и прочитанное в интернете
     escalation: dict | None = None  # {reason, expert_question}, если агент рекомендовал эксперта
+    issues: list[dict] = field(default_factory=list)  # обращения, показанные агенту: упомянутые и возможные дубли
 
 
 def available_tools(ctx: ToolContext) -> list[dict]:
     unavailable: set[str] = set()
-    if ctx.store is None:  # без PostgreSQL инструменты графа и реестров не предлагаются вовсе
-        unavailable |= {"graph_query", "sql"}
+    if ctx.store is None:  # без PostgreSQL инструменты графа, реестров и обращений не предлагаются вовсе
+        unavailable |= {"graph_query", "sql", "get_issue", "search_issues"}
     s = ctx.settings
     if not (getattr(s, "web_search", False) and s.yc_api_key and s.yc_folder_id):  # интернет выключен или нет ключа
         unavailable |= {"web_search", "read_page"}
@@ -241,6 +267,17 @@ def _prefetch_message(question: str, ctx: ToolContext, k: int, attached: str = "
     head = f"Вопрос: {question}"
     if attached:
         head += f"\n\nПриложено к вопросу (файлы аналитика, в базе проекта их нет):\n\n{attached}"
+    if ctx.store is not None:  # упомянутые номера и возможные дубли — до первого вызова модели
+        from copilot1c.agent.issues_tools import issue_context
+
+        try:
+            block, ctx.issues = issue_context(ctx.store.conn, ctx.settings.project,
+                                              " ".join(x for x in (question, search_query) if x))
+        except Exception as exc:  # noqa: BLE001 — база обращений недоступна: ответ по документам всё равно будет
+            ctx.store.conn.rollback()
+            block = f"(Обращения не проверены: {type(exc).__name__}. Можно вызвать search_issues.)"
+        if block:
+            head += f"\n\nОбращения:\n\n{block}"
     try:
         hits = _search(ctx, search_query or question, {"project": ctx.settings.project}, k)
     except Exception as exc:  # noqa: BLE001 — без предварительного поиска агент всё равно может искать сам
@@ -267,7 +304,7 @@ def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: i
         msg = resp.choices[0].message
         if not msg.tool_calls:
             if msg.content:
-                return AgentResult(msg.content, trace, step, ctx.web_sources, ctx.escalation)
+                return AgentResult(msg.content, trace, step, ctx.web_sources, ctx.escalation, ctx.issues)
             break
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
@@ -298,7 +335,7 @@ def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: i
     except Exception:  # noqa: BLE001 — если tool_choice не поддержан, повторяем без инструментов
         resp = client(s).chat.completions.create(model=model, messages=messages, temperature=0.1)
     return AgentResult(resp.choices[0].message.content or "Ответ не получен.", trace, max_steps + 1, ctx.web_sources,
-                       ctx.escalation)
+                       ctx.escalation, ctx.issues)
 
 
 def ask(question: str, ctx: ToolContext, max_steps: int = 6) -> str:
