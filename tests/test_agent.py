@@ -71,7 +71,8 @@ def test_answers_immediately_from_prefetched_fragments(monkeypatch):
     assert r.answer == "Ответ: LTS 11.5.27" and r.steps == 1 and r.trace == []
     assert "нужна стабильная LTS" in chat.requests[0]["messages"][1]["content"]  # фрагменты уже в вопросе
     tool_names = {t["function"]["name"] for t in chat.requests[0]["tools"]}
-    assert tool_names == {"search_docs"}  # нет кода, графа и платформы — лишних инструментов нет
+    # нет кода, графа, платформы и ключей для интернета — остаются поиск по базе и рекомендация эксперта
+    assert tool_names == {"search_docs", "prepare_escalation"}
 
 
 def test_repeated_calls_deduplicated_and_final_answer_forced(monkeypatch):

@@ -51,7 +51,8 @@ def test_ask_returns_web_compatible_payload(monkeypatch):
     body = r.json()
     assert r.status_code == 200 and asked == ["Почему не 11.6?"]
     # формат /api/ask веба + тип сообщения и черновик обращения (для вопроса — пусто)
-    assert set(body) == {"answer", "sources", "seconds", "steps", "tools", "intent", "issue_draft", "web_sources"}
+    assert set(body) == {"answer", "sources", "seconds", "steps", "tools", "intent", "issue_draft", "web_sources",
+                         "escalation"}
     assert body["intent"]["primary"] == "question" and body["issue_draft"] is None
     assert body["sources"][0]["label"].startswith("письмо") and body["tools"] == ["search_docs"] and body["steps"] == 2
 

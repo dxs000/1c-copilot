@@ -10,6 +10,9 @@
                сообщения (вопрос, проблема, сводка, документ, знание) и issue_draft — черновик обращения, если
                это сообщение о проблеме (intent.py; ничего не сохраняется).
   POST /classify — только тип сообщения и черновик обращения, без агента.
+  POST /escalations — пакет для эксперта (Claude) через оператора: multipart payload (JSON: question,
+               expert_question, reason, answer, sources, web_sources, tools, issue_id, include_raw) + files;
+               архив в .cache/escalations (escalate.py). GET /escalations/{id} — скачать архив.
   POST /ask/files — вопрос с файлами («+» в чате, multipart: question, files): текст писем, документов и
                картинок идёт агенту контекстом этого вопроса (в базу не сохраняется, chat_files.py); для
                письма о проблеме черновик обращения дополняется инициатором, датой и Message-ID.
@@ -366,7 +369,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
-                "web_sources": getattr(result, "web_sources", [])}
+                "web_sources": getattr(result, "web_sources", []), "escalation": getattr(result, "escalation", None)}
 
     @app.post("/ask/files")
     def ask_files(question: str = Form(..., min_length=2, max_length=2000),
@@ -403,7 +406,68 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
-                "attachments": [it.out() for it in items], "web_sources": getattr(result, "web_sources", [])}
+                "attachments": [it.out() for it in items], "web_sources": getattr(result, "web_sources", []),
+                "escalation": getattr(result, "escalation", None)}
+
+    @app.post("/escalations")
+    def escalation_create(payload: str = Form("{}"), files: list[UploadFile] | None = File(None)) -> dict[str, Any]:
+        from copilot1c.escalate import EscalationInput, build, package_name, store
+        from copilot1c.materials import MAX_UPLOAD_BYTES
+
+        try:
+            p = json.loads(payload or "{}")
+        except ValueError as exc:
+            raise HTTPException(422, "payload — не JSON") from exc
+        question = str(p.get("question") or "").strip()
+        issue, related, raw = None, None, []
+        for f in files or []:
+            data = f.file.read(MAX_UPLOAD_BYTES + 1)
+            if data and len(data) <= MAX_UPLOAD_BYTES:
+                raw.append((f.filename or "файл", data))
+        if p.get("issue_id"):
+            from copilot1c.related import find_related
+
+            g, reg = _issues(s)
+            try:
+                issue = reg.get(int(p["issue_id"]))
+                if issue is None:
+                    raise HTTPException(404, "Обращение не найдено")
+                related = find_related(g.conn, s.project, issue, exclude_id=issue["id"])
+                related = _related_out(related)
+                for a in issue.get("attachments") or []:  # вложения обращения — тоже материалы пакета
+                    row = reg.attachment(issue["id"], a["id"])
+                    path = Path(row["path"]) if row else None
+                    if path is not None and not path.is_absolute():
+                        path = Path.cwd() / path
+                    if path is not None and path.is_file() and path.stat().st_size <= MAX_UPLOAD_BYTES:
+                        raw.append((row["filename"], path.read_bytes()))
+            finally:
+                g.close()
+            question = question or f"{issue['number']}: {issue['title']}"
+        if len(question) < 2:
+            raise HTTPException(422, "Нужен вопрос или обращение")
+        inp = EscalationInput(
+            question=question, expert_question=str(p.get("expert_question") or ""), reason=str(p.get("reason") or ""),
+            answer=str(p.get("answer") or ""), sources=list(p.get("sources") or [])[:30],
+            web_sources=list(p.get("web_sources") or [])[:20], tools=[str(t) for t in p.get("tools") or []][:30],
+            attachments=raw[:20], include_raw=bool(p.get("include_raw")), issue=issue, related=related)
+        try:
+            data, manifest = build(inp, s)
+        except ValueError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        store(Path(s.cache_dir or ".cache") / "escalations", data, manifest)
+        return {"id": manifest["id"], "filename": package_name(manifest), "size": manifest["size"],
+                "files": manifest["files"], "raw_attachments": manifest["raw_attachments"]}
+
+    @app.get("/escalations/{package_id}")
+    def escalation_get(package_id: str):
+        from copilot1c.escalate import load, package_name
+
+        found = load(Path(s.cache_dir or ".cache") / "escalations", package_id)
+        if found is None:
+            raise HTTPException(404, "Пакет не найден")
+        path, manifest = found
+        return FileResponse(path, media_type="application/zip", filename=package_name(manifest))
 
     @app.post("/classify")
     def classify_endpoint(req: ClassifyRequest) -> dict[str, Any]:

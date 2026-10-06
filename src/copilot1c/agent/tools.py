@@ -41,6 +41,11 @@ SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта
 лучшей ссылке. Найденное в интернете помечай в ответе «по данным интернета» со ссылкой и отделяй от
 фактов проекта; противоречие между ними называй явно.
 
+Эксперт. Если ответа нет ни в базе проекта, ни в интернете, или задача требует глубокой работы (разбор и
+правка кода BSL, проектирование доработки, длинная цепочка рассуждений, противоречивые источники) — вызови
+prepare_escalation: укажи, почему не справился, и сформулируй точный вопрос эксперту. Пакет соберёт
+аналитик. Всё равно дай в ответе то, что удалось выяснить, и прямо скажи, чего не хватает.
+
 Приложенные файлы. Если в сообщении есть блок «Приложено к вопросу» — это материалы, которые аналитик
 приложил сейчас (письма, документы, скриншоты); их нет в базе проекта. Используй их как главный
 контекст вопроса и ссылайся на них как «приложенный файл «имя»»; факты из базы проекта — как обычно.
@@ -79,6 +84,12 @@ TOOLS = [
                    "description": "Ограничить сайтами, напр. its.1c.ru, v8.1c.ru, infostart.ru"}}, ["query"]),
     _fn("read_page", "Текст страницы из результатов web_search, если фрагмента недостаточно.",
         {"url": _STR}, ["url"]),
+    _fn("prepare_escalation", "Рекомендовать передать вопрос эксперту (Claude) через оператора: аналитику будет "
+        "предложено собрать пакет с промтом и материалами. Только если ответа нет в базе и в интернете или задача "
+        "требует глубокой работы.",
+        {"reason": {"type": "string", "description": "Почему не удалось ответить уверенно"},
+         "expert_question": {"type": "string", "description": "Точный вопрос эксперту, с нужными деталями"}},
+        ["reason", "expert_question"]),
     _fn("build_and_check", "Собрать расширение из XML/BSL в песочнице 1С и проверить /CheckModules.",
         {"src_dir": _STR, "extension": _STR}, ["src_dir", "extension"]),
 ]
@@ -93,6 +104,7 @@ class ToolContext:
     web_sources: list[dict] = field(default_factory=list)  # что агент нашёл и прочитал в интернете
     web_searches: int = 0
     web_pages: int = 0
+    escalation: dict | None = None  # рекомендация агента передать вопрос эксперту
 
 
 def _raw_search(ctx: ToolContext) -> Callable[[str, dict, int], list[dict]]:
@@ -184,13 +196,18 @@ def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
                                     "domain": page["url"].split("/")[2], "read": True})
         return {**page, "источник": f"интернет: {page['title'] or page['url']} — {page['url']}"}
 
+    def prepare_escalation(reason: str, expert_question: str):
+        ctx.escalation = {"reason": (reason or "").strip()[:2000], "expert_question": (expert_question or "").strip()[:4000]}
+        return {"ok": True, "note": "Аналитику будет предложено собрать пакет для эксперта. Дай в ответе то, что "
+                                    "удалось выяснить, и скажи, чего не хватает."}
+
     def build_and_check(src_dir: str, extension: str):
         out = Path(src_dir).with_suffix(".cfe")
         results = Designer(ctx.settings).build_extension(src_dir, out, extension)
         return [{"step": r.argv[r.argv.index("/Out") + 2], "ok": r.ok, "log": r.log[-4000:]} for r in results]
 
     return {f.__name__: f for f in (search_docs, search_code, graph_query, get_module, diff_versions, sql,
-                                     web_search, read_page, build_and_check)}
+                                     web_search, read_page, prepare_escalation, build_and_check)}
 
 
 @dataclass
@@ -199,6 +216,7 @@ class AgentResult:
     trace: list[dict]  # вызовы инструментов: {"tool", "args", "result_chars" | "repeat" | "error"}
     steps: int
     web_sources: list[dict] = field(default_factory=list)  # найденное и прочитанное в интернете
+    escalation: dict | None = None  # {reason, expert_question}, если агент рекомендовал эксперта
 
 
 def available_tools(ctx: ToolContext) -> list[dict]:
@@ -249,7 +267,7 @@ def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: i
         msg = resp.choices[0].message
         if not msg.tool_calls:
             if msg.content:
-                return AgentResult(msg.content, trace, step, ctx.web_sources)
+                return AgentResult(msg.content, trace, step, ctx.web_sources, ctx.escalation)
             break
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
@@ -279,7 +297,8 @@ def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: i
                                                  temperature=0.1)
     except Exception:  # noqa: BLE001 — если tool_choice не поддержан, повторяем без инструментов
         resp = client(s).chat.completions.create(model=model, messages=messages, temperature=0.1)
-    return AgentResult(resp.choices[0].message.content or "Ответ не получен.", trace, max_steps + 1, ctx.web_sources)
+    return AgentResult(resp.choices[0].message.content or "Ответ не получен.", trace, max_steps + 1, ctx.web_sources,
+                       ctx.escalation)
 
 
 def ask(question: str, ctx: ToolContext, max_steps: int = 6) -> str:
