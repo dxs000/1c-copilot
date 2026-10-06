@@ -16,13 +16,14 @@ RestartSec=5
 
 # Ограничения: писать можно только в кэш, папку материалов и вложения обращений; порт 8100 — без особых прав.
 # Новая папка, в которую пишет ядро, должна быть добавлена сюда — иначе «Read-only file system».
-# Папки создаёт ExecStartPre (с «+» — до песочницы и от root), поэтому на чистой установке служба тоже стартует.
+# Папки создаёт ExecStartPre (с «+» — от root). Песочницу systemd строит и для него, поэтому пути в
+# ReadWritePaths — с «-»: отсутствующая папка не мешает запуску, а к старту основного процесса она уже создана.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ExecStartPre=+/usr/bin/install -d -o copilot -g copilot /opt/1c-copilot/.cache /opt/1c-copilot/data /opt/1c-copilot/issues
-ReadWritePaths=/opt/1c-copilot/.cache /opt/1c-copilot/data /opt/1c-copilot/issues
+ReadWritePaths=-/opt/1c-copilot/.cache -/opt/1c-copilot/data -/opt/1c-copilot/issues
 
 [Install]
 WantedBy=multi-user.target
