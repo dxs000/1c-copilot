@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # адреса аналитиков. Инициатор — последний автор цепочки из своих доменов, который не аналитик.
     # Тип сообщения в чате: неуверенные случаи эвристик уточняет модель (model_batch); false — только эвристики
     intent_llm: bool = True
+    # Поиск в интернете для агента (Yandex Search API v2, ключ AI Studio): выключатель, лимиты на один вопрос,
+    # запрещённые для отправки слова сверх своих доменов и аналитиков (название заказчика и т. п.)
+    web_search: bool = True
+    web_max_searches: int = 3
+    web_max_pages: int = 3
+    web_blocked_terms: StrList = ("Pierre Fabre", "Пьер Фабр")
     internal_domains: StrList = ()
     analyst_emails: StrList = ()
     # Конвертация старых форматов (.doc, .xls, .rtf, .odt) через LibreOffice
@@ -69,7 +75,7 @@ class Settings(BaseSettings):
     # Префиксы доработок интегратора: по ним отделяются нетиповые объекты
     custom_prefixes: tuple[str, ...] = ("КС_", "(КС)")
 
-    @field_validator("analysts", "internal_domains", "analyst_emails", mode="before")
+    @field_validator("analysts", "internal_domains", "analyst_emails", "web_blocked_terms", mode="before")
     @classmethod
     def _str_list(cls, v):
         if isinstance(v, str):

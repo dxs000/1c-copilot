@@ -199,6 +199,27 @@ def serve(host: str = typer.Option("127.0.0.1", help="Только localhost: н
     uvicorn.run(create_app(start_worker=True), host=host, port=port, log_level="info")
 
 
+@app.command("web-search")
+def web_search_cmd(query: str, sites: list[str] = typer.Option(None, "--site", help="Ограничить сайтом (можно несколько)"),
+                   read: bool = typer.Option(False, help="Прочитать первую найденную страницу")):
+    """Проверить поиск в интернете (Yandex Search API) так, как его видит агент: что ушло и что вернулось."""
+    from copilot1c.web import WebError, read_page, web_search
+
+    s = get_settings()
+    try:
+        found = web_search(query, s, sites=sites)
+    except WebError as exc:
+        raise typer.Exit(typer.echo(f"Ошибка: {exc}") or 1) from exc
+    typer.echo(f"Отправлено: {found['query_sent']}")
+    for r in found["removed"]:
+        typer.echo(f"  вырезано — {r}")
+    for i, r in enumerate(found["results"], 1):
+        typer.echo(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet'][:200]}")
+    if read and found["results"]:
+        page = read_page(found["results"][0]["url"], s)
+        typer.echo(f"\n--- {page['title']} ({len(page['text'])} знаков) ---\n{page['text'][:1500]}")
+
+
 @app.command("eval")
 def eval_cmd(golden: Path = typer.Argument(..., help="JSON с эталонными вопросами (см. tests/eval/example.json)"),
              answers: bool = typer.Option(False, help="Проверять и ответы агента (дольше и дороже)"),

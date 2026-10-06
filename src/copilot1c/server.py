@@ -365,7 +365,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             raise HTTPException(502, f"Ошибка обращения к Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
-                "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind}
+                "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
+                "web_sources": getattr(result, "web_sources", [])}
 
     @app.post("/ask/files")
     def ask_files(question: str = Form(..., min_length=2, max_length=2000),
@@ -402,7 +403,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
-                "attachments": [it.out() for it in items]}
+                "attachments": [it.out() for it in items], "web_sources": getattr(result, "web_sources", [])}
 
     @app.post("/classify")
     def classify_endpoint(req: ClassifyRequest) -> dict[str, Any]:

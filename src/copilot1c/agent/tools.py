@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,15 @@ SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта
 отвечай, без вызова инструментов. Инструменты вызывай, только если нужного факта во фрагментах нет;
 не повторяй один и тот же запрос. Аналитические вопросы («что не покрыто», «что затронет
 обновление») решай в несколько шагов: поиск → граф → SQL.
+
+Интернет (web_search, read_page) — только после базы проекта и только если ответа там нет, а вопрос
+про платформу 1С, типовую конфигурацию, текст ошибки, версии, методику — то, что известно вне проекта.
+Договорённости, сроки, переписку и ТЗ проекта в интернете не ищи — их там нет. Запрос в интернет
+формулируй только из текста ошибки, имён объектов метаданных, номеров версий и общих слов: без имён
+людей, e-mail, телефонов, серверов и названия заказчика (система это проверяет и вырежет). Для 1С
+предпочитай its.1c.ru, v8.1c.ru, infostart.ru (параметр sites). Если фрагмента мало — read_page по
+лучшей ссылке. Найденное в интернете помечай в ответе «по данным интернета» со ссылкой и отделяй от
+фактов проекта; противоречие между ними называй явно.
 
 Приложенные файлы. Если в сообщении есть блок «Приложено к вопросу» — это материалы, которые аналитик
 приложил сейчас (письма, документы, скриншоты); их нет в базе проекта. Используй их как главный
@@ -63,6 +72,13 @@ TOOLS = [
         {"base": _STR, "target": _STR, "path": _STR}, ["base", "target"]),
     _fn("sql", "SELECT-запрос только на чтение к реестрам: test_cases, requirements, md_objects, "
         "bsl_methods, bsl_calls, uncovered_requirements, custom_objects.", {"query": _STR}, ["query"]),
+    _fn("web_search", "Поиск в интернете (Yandex). Только когда в базе проекта ответа нет и вопрос про платформу, "
+        "типовую конфигурацию, ошибку, версии. Запрос — без имён, контактов, серверов и названия заказчика.",
+        {"query": {"type": "string", "description": "Текст ошибки, объекты 1С, версии, общие слова"},
+         "sites": {"type": "array", "items": {"type": "string"},
+                   "description": "Ограничить сайтами, напр. its.1c.ru, v8.1c.ru, infostart.ru"}}, ["query"]),
+    _fn("read_page", "Текст страницы из результатов web_search, если фрагмента недостаточно.",
+        {"url": _STR}, ["url"]),
     _fn("build_and_check", "Собрать расширение из XML/BSL в песочнице 1С и проверить /CheckModules.",
         {"src_dir": _STR, "extension": _STR}, ["src_dir", "extension"]),
 ]
@@ -74,6 +90,9 @@ class ToolContext:
     vector_store_id: str
     dumps_root: Path  # Git-репозиторий выгрузок: <dumps_root>/<config>/...
     store: GraphStore | None = None
+    web_sources: list[dict] = field(default_factory=list)  # что агент нашёл и прочитал в интернете
+    web_searches: int = 0
+    web_pages: int = 0
 
 
 def _raw_search(ctx: ToolContext) -> Callable[[str, dict, int], list[dict]]:
@@ -128,13 +147,50 @@ def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
             return {"error": "разрешены только SELECT-запросы"}
         return ctx.store.query(query)
 
+    def web_search(query: str, sites: list[str] | None = None):
+        from copilot1c.web import WebError
+        from copilot1c.web import web_search as search
+
+        if ctx.web_searches >= ctx.settings.web_max_searches:
+            return {"error": f"лимит поисков в интернете на вопрос ({ctx.settings.web_max_searches}) исчерпан — "
+                             "отвечай по найденному"}
+        ctx.web_searches += 1
+        try:
+            found = search(query, ctx.settings, sites=sites)
+        except WebError as exc:
+            return {"error": str(exc)}
+        for r in found["results"]:
+            if not any(w["url"] == r["url"] for w in ctx.web_sources):
+                ctx.web_sources.append({"title": r["title"], "url": r["url"], "domain": r["domain"], "read": False})
+        return {"запрос_отправлен": found["query_sent"], "вырезано": found["removed"],
+                "results": [{**r, "источник": f"интернет: {r['title']} — {r['url']}"} for r in found["results"]]}
+
+    def read_page(url: str):
+        from copilot1c.web import WebError
+        from copilot1c.web import read_page as fetch
+
+        if ctx.web_pages >= ctx.settings.web_max_pages:
+            return {"error": f"лимит чтения страниц на вопрос ({ctx.settings.web_max_pages}) исчерпан"}
+        ctx.web_pages += 1
+        try:
+            page = fetch(url, ctx.settings)
+        except WebError as exc:
+            return {"error": str(exc)}
+        known = next((w for w in ctx.web_sources if w["url"] in (url, page["url"])), None)
+        if known:
+            known["read"] = True
+        else:
+            ctx.web_sources.append({"title": page["title"] or page["url"], "url": page["url"],
+                                    "domain": page["url"].split("/")[2], "read": True})
+        return {**page, "источник": f"интернет: {page['title'] or page['url']} — {page['url']}"}
+
     def build_and_check(src_dir: str, extension: str):
         out = Path(src_dir).with_suffix(".cfe")
         results = Designer(ctx.settings).build_extension(src_dir, out, extension)
         return [{"step": r.argv[r.argv.index("/Out") + 2], "ok": r.ok, "log": r.log[-4000:]} for r in results]
 
     return {f.__name__: f for f in (search_docs, search_code, graph_query, get_module, diff_versions, sql,
-                                     build_and_check)}
+                                     web_search, read_page, build_and_check)}
 
 
 @dataclass
@@ -142,12 +198,16 @@ class AgentResult:
     answer: str
     trace: list[dict]  # вызовы инструментов: {"tool", "args", "result_chars" | "repeat" | "error"}
     steps: int
+    web_sources: list[dict] = field(default_factory=list)  # найденное и прочитанное в интернете
 
 
 def available_tools(ctx: ToolContext) -> list[dict]:
     unavailable: set[str] = set()
     if ctx.store is None:  # без PostgreSQL инструменты графа и реестров не предлагаются вовсе
         unavailable |= {"graph_query", "sql"}
+    s = ctx.settings
+    if not (getattr(s, "web_search", False) and s.yc_api_key and s.yc_folder_id):  # интернет выключен или нет ключа
+        unavailable |= {"web_search", "read_page"}
     if not ctx.dumps_root.exists():  # код 1С ещё не выгружен и не проиндексирован
         unavailable |= {"get_module", "diff_versions", "search_code"}
     if not Path(ctx.settings.onec_bin).exists():
@@ -189,7 +249,7 @@ def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: i
         msg = resp.choices[0].message
         if not msg.tool_calls:
             if msg.content:
-                return AgentResult(msg.content, trace, step)
+                return AgentResult(msg.content, trace, step, ctx.web_sources)
             break
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
@@ -219,7 +279,7 @@ def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: i
                                                  temperature=0.1)
     except Exception:  # noqa: BLE001 — если tool_choice не поддержан, повторяем без инструментов
         resp = client(s).chat.completions.create(model=model, messages=messages, temperature=0.1)
-    return AgentResult(resp.choices[0].message.content or "Ответ не получен.", trace, max_steps + 1)
+    return AgentResult(resp.choices[0].message.content or "Ответ не получен.", trace, max_steps + 1, ctx.web_sources)
 
 
 def ask(question: str, ctx: ToolContext, max_steps: int = 6) -> str:
