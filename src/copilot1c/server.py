@@ -20,6 +20,8 @@
   PATCH /issues/{id} — правка полей с версией (409 при одновременной правке) и комментарием;
   POST  /issues/{id}/comments, POST /issues/{id}/attachments (multipart files),
   GET   /issues/{id}/attachments/{aid} — файл вложения;
+  GET   /issues/{id}/related, POST /issues/related (черновик) — похожие обращения (дубли) и связанные
+        тест-кейсы ПиМИ и пункты ТЗ (related.py);
   POST  /issues/from-email — разбор письма (.msg/.eml) в черновик: инициатор, дата, тема, текст, цепочка;
         ничего не сохраняет. POST /issues/{id}/attachments с expand=true — письмо прикрепляется вместе
         с файлами, вложенными в него (скриншоты, логи);
@@ -216,6 +218,13 @@ class IssuePatch(BaseModel):
     changes: IssueFields = Field(default_factory=IssueFields)
     comment: str | None = None
     actor: str | None = None
+
+
+class RelatedIn(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    error_text: str | None = None
+    objects: list[str] = Field(default_factory=list)
 
 
 class CommentIn(BaseModel):
@@ -428,6 +437,39 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         if issue is None:
             raise HTTPException(404, "Обращение не найдено")
         return issue
+
+    def _related_out(found: dict[str, list]) -> dict[str, Any]:
+        from copilot1c.issues import STATUSES, number
+
+        for x in found["issues"]:
+            x["number"] = number(x["id"])
+            x["status_label"] = STATUSES.get(x["status"], x["status"])
+            x["created_at"] = x["created_at"].isoformat(timespec="seconds") if x.get("created_at") else None
+        return found
+
+    @app.get("/issues/{issue_id}/related")
+    def issues_related(issue_id: int) -> dict[str, Any]:
+        from copilot1c.related import find_related
+
+        g, reg = _issues(s)
+        try:
+            issue = reg.get(issue_id)
+            if issue is None:
+                raise HTTPException(404, "Обращение не найдено")
+            return _related_out(find_related(g.conn, s.project, issue, exclude_id=issue_id))
+        finally:
+            g.close()
+
+    @app.post("/issues/related")
+    def issues_related_draft(req: RelatedIn) -> dict[str, Any]:
+        """Для черновика: нового обращения в карточке или карточки в чате."""
+        from copilot1c.related import find_related
+
+        g, _reg = _issues(s)
+        try:
+            return _related_out(find_related(g.conn, s.project, req.model_dump()))
+        finally:
+            g.close()
 
     @app.post("/issues/from-email")
     def issues_from_email(file: UploadFile = File(...)) -> dict[str, Any]:

@@ -56,6 +56,7 @@ RAG-системы для 1С на Yandex Cloud AI».
 | `issues.py` | Обращения, контакты-инициаторы, вложения и история |
 | `email_intake.py` | Письмо → черновик обращения: цепочка, инициатор, подпись, файлы |
 | `intent.py` | Тип сообщения в чате (эвристики + модель) и черновик обращения из текста |
+| `related.py` | Похожие обращения (дубли), связанные тест-кейсы ПиМИ и пункты ТЗ |
 
 ## Быстрый старт
 
@@ -120,7 +121,7 @@ journalctl -u copilot1c-core -f
 
 Методы демона: `GET /issues/meta`, `GET|POST /issues`, `GET|PATCH /issues/{id}`,
 `POST /issues/{id}/comments`, `POST /issues/{id}/attachments`, `GET /issues/{id}/attachments/{aid}`,
-`GET|POST /contacts`, `POST /classify`. Список аналитиков — `COPILOT_ANALYSTS` в `.env` (JSON-список).
+`GET|POST /contacts`, `POST /classify`, `GET /issues/{id}/related`, `POST /issues/related`. Список аналитиков — `COPILOT_ANALYSTS` в `.env` (JSON-список).
 После обновления ядра таблицы создаются командой `copilot1c init-db` (существующие данные не трогаются).
 
 Тип сообщения в чате (`intent.py`): `POST /ask` кроме ответа агента возвращает `intent` — вопрос,
