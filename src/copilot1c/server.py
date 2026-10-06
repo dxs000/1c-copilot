@@ -10,6 +10,9 @@
                сообщения (вопрос, проблема, сводка, документ, знание) и issue_draft — черновик обращения, если
                это сообщение о проблеме (intent.py; ничего не сохраняется).
   POST /classify — только тип сообщения и черновик обращения, без агента.
+  POST /ask/files — вопрос с файлами («+» в чате, multipart: question, files): текст писем, документов и
+               картинок идёт агенту контекстом этого вопроса (в базу не сохраняется, chat_files.py); для
+               письма о проблеме черновик обращения дополняется инициатором, датой и Message-ID.
   POST /materials — загрузить файлы (multipart, поле files): сохраняются в data/uploads, попадают в реестр.
   GET  /materials, GET /materials/{id} — реестр загруженных материалов и их статусы. Обработку
                (разбор → индексация → запись в базу) ведёт фоновый поток, см. worker.py.
@@ -148,13 +151,16 @@ def search_sources(s: Settings, question: str, k: int = 8) -> list[dict[str, Any
     return out
 
 
-def run_question(s: Settings, question: str):
+def run_question(s: Settings, question: str, attached: str = "", search_query: str | None = None):
     from copilot1c.agent.tools import ToolContext, run_agent
     from copilot1c.graph.store import try_connect
 
     store = try_connect(s)
     try:
-        return run_agent(question, ToolContext(s, s.vector_store_id, Path("data/dumps"), store))
+        ctx = ToolContext(s, s.vector_store_id, Path("data/dumps"), store)
+        if attached or search_query:
+            return run_agent(question, ctx, attached=attached, search_query=search_query)
+        return run_agent(question, ctx)
     finally:
         if store is not None:
             store.close()
@@ -258,6 +264,43 @@ def iss_number(issue_id: int) -> str:
     return number(issue_id)
 
 
+def _email_for_issue(s: Settings, raw: list[tuple[str, bytes]]) -> dict[str, Any] | None:
+    """Первое приложенное письмо → поля черновика обращения: тема, текст, дата, инициатор, Message-ID,
+    найденный контакт и «уже зарегистрировано». Ошибка разбора — без этих полей, ответ не ломается."""
+    from copilot1c.email_intake import analyze, is_email_file, proposal
+
+    first = next(((n, d) for n, d in raw if is_email_file(n)), None)
+    if first is None:
+        return None
+    try:
+        p = proposal(first[0], analyze(first[0], first[1], s.internal_domains, s.analyst_emails, s.analysts))
+    except Exception as exc:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("copilot1c.chat_files").warning("письмо не разобрано для обращения: %s", exc)
+        return None
+    out = {k: v for k, v in p["draft"].items() if v}
+    out["initiator"] = p["initiator"]
+    out["contact"] = None
+    out["already_registered"] = None
+    from copilot1c.graph.store import try_connect
+
+    g = try_connect(s)
+    if g is not None:
+        from copilot1c.issues import IssueRegistry, number
+
+        try:
+            reg = IssueRegistry(g.conn, s.project)
+            if p["initiator"]:
+                out["contact"] = reg.contact_by_email(p["initiator"]["email"])
+            row = reg.find_by_message_id(out["source_message_id"]) if out.get("source_message_id") else None
+            if row is not None:
+                out["already_registered"] = {"id": row["id"], "number": number(row["id"]), "title": row["title"]}
+        finally:
+            g.close()
+    return out
+
+
 def _issues(s: Settings):
     """Подключение к PostgreSQL и реестр обращений; 503, если базы нет."""
     from copilot1c.graph.store import try_connect
@@ -323,6 +366,43 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind}
+
+    @app.post("/ask/files")
+    def ask_files(question: str = Form(..., min_length=2, max_length=2000),
+                  files: list[UploadFile] = File(...)) -> dict[str, Any]:
+        from copilot1c.chat_files import MAX_FILES, context_block, extract
+        from copilot1c.materials import MAX_UPLOAD_BYTES
+
+        if not (s.yc_api_key and s.yc_folder_id and s.vector_store_id):
+            raise HTTPException(503, "Не настроены ключи Yandex или COPILOT_VECTOR_STORE_ID в .env ядра")
+        if len(files) > MAX_FILES:
+            raise HTTPException(413, f"Не больше {MAX_FILES} файлов к одному вопросу")
+        question = question.strip()
+        t0 = time.monotonic()
+        raw = []
+        for f in files:
+            data = f.file.read(MAX_UPLOAD_BYTES + 1)
+            if data and len(data) <= MAX_UPLOAD_BYTES:
+                raw.append((f.filename or "файл", data))
+        items = extract(raw, s)
+        attached = context_block(items)
+        emails = [it for it in items if it.kind == "email"]
+        # тип сообщения — по вопросу и тексту писем (проблему обычно описывает письмо, а не вопрос)
+        kind = classify_message(s, "\n\n".join([question, *(e.text[:4000] for e in emails)]), has_files=True)
+        email_info = _email_for_issue(s, raw) if kind.get("issue_draft") else None
+        if email_info:
+            kind["issue_draft"] = {**kind["issue_draft"], **email_info}
+        subjects = " ".join(dict.fromkeys(e.subject for e in emails if e.subject))
+        search_query = f"{question} {subjects}".strip() if subjects else None
+        try:
+            sources = search_sources(s, search_query or question)
+            result = run_question(s, question, attached, search_query)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"Ошибка обращения к Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
+                from exc
+        return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
+                "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
+                "attachments": [it.out() for it in items]}
 
     @app.post("/classify")
     def classify_endpoint(req: ClassifyRequest) -> dict[str, Any]:

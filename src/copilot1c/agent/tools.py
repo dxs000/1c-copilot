@@ -32,6 +32,10 @@ SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта
 не повторяй один и тот же запрос. Аналитические вопросы («что не покрыто», «что затронет
 обновление») решай в несколько шагов: поиск → граф → SQL.
 
+Приложенные файлы. Если в сообщении есть блок «Приложено к вопросу» — это материалы, которые аналитик
+приложил сейчас (письма, документы, скриншоты); их нет в базе проекта. Используй их как главный
+контекст вопроса и ссылайся на них как «приложенный файл «имя»»; факты из базы проекта — как обычно.
+
 Предметная область. Объекты с префиксом КС_ или суффиксом (КС) — доработки интегратора.
 Сгенерированный код перед выдачей проверяй инструментом build_and_check."""
 
@@ -151,23 +155,31 @@ def available_tools(ctx: ToolContext) -> list[dict]:
     return [t for t in TOOLS if t["function"]["name"] not in unavailable]
 
 
-def _prefetch_message(question: str, ctx: ToolContext, k: int) -> str:
-    """Поиск до первого вызова модели: на простые вопросы она отвечает сразу, без цикла инструментов."""
+def _prefetch_message(question: str, ctx: ToolContext, k: int, attached: str = "",
+                      search_query: str | None = None) -> str:
+    """Поиск до первого вызова модели: на простые вопросы она отвечает сразу, без цикла инструментов.
+    attached — текст файлов, приложенных к вопросу в чате; search_query — запрос для поиска, если он
+    должен отличаться от вопроса (например, вопрос «что тут?» + тема приложенного письма)."""
+    head = f"Вопрос: {question}"
+    if attached:
+        head += f"\n\nПриложено к вопросу (файлы аналитика, в базе проекта их нет):\n\n{attached}"
     try:
-        hits = _search(ctx, question, {"project": ctx.settings.project}, k)
+        hits = _search(ctx, search_query or question, {"project": ctx.settings.project}, k)
     except Exception as exc:  # noqa: BLE001 — без предварительного поиска агент всё равно может искать сам
-        return f"{question}\n\n(Предварительный поиск не удался: {type(exc).__name__}. Используй инструменты.)"
+        return f"{head}\n\n(Предварительный поиск не удался: {type(exc).__name__}. Используй инструменты.)"
     found = "\n\n".join(f"[{i}] Источник: {h['источник']}\n{h['текст']}" for i, h in enumerate(hits, 1))
-    return f"Вопрос: {question}\n\nНайденные фрагменты:\n\n{found or '(ничего не найдено)'}"
+    return f"{head}\n\nНайденные фрагменты:\n\n{found or '(ничего не найдено)'}"
 
 
-def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: int = 8) -> AgentResult:
+def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: int = 8, attached: str = "",
+              search_query: str | None = None) -> AgentResult:
     """Цикл агента: предварительный поиск → модель с инструментами → обязательный финальный ответ."""
     s = ctx.settings or get_settings()
     handlers = make_handlers(ctx)
     tools = available_tools(ctx)
+    first = _prefetch_message(question, ctx, prefetch_k, attached, search_query)
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT},
-                                      {"role": "user", "content": _prefetch_message(question, ctx, prefetch_k)}]
+                                      {"role": "user", "content": first}]
     trace: list[dict] = []
     seen_calls: dict[str, str] = {}
     model = s.model_uri(s.model_orchestrator)
