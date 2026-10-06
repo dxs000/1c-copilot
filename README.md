@@ -57,6 +57,7 @@ RAG-системы для 1С на Yandex Cloud AI».
 | `email_intake.py` | Письмо → черновик обращения: цепочка, инициатор, подпись, файлы |
 | `intent.py` | Тип сообщения в чате (эвристики + модель) и черновик обращения из текста |
 | `related.py` | Похожие обращения (дубли), связанные тест-кейсы ПиМИ и пункты ТЗ |
+| `kb.py` | Решённое обращение → разбор «симптом → причина → решение» для базы знаний |
 
 ## Быстрый старт
 
@@ -121,13 +122,17 @@ journalctl -u copilot1c-core -f
 
 Методы демона: `GET /issues/meta`, `GET|POST /issues`, `GET|PATCH /issues/{id}`,
 `POST /issues/{id}/comments`, `POST /issues/{id}/attachments`, `GET /issues/{id}/attachments/{aid}`,
-`GET|POST /contacts`, `POST /classify`, `GET /issues/{id}/related`, `POST /issues/related`. Список аналитиков — `COPILOT_ANALYSTS` в `.env` (JSON-список).
+`GET|POST /contacts`, `POST /classify`, `GET /issues/{id}/related`, `POST /issues/related`, `POST /issues/{id}/kb-draft`, `POST /issues/{id}/kb-publish`. Список аналитиков — `COPILOT_ANALYSTS` в `.env` (JSON-список).
 После обновления ядра таблицы создаются командой `copilot1c init-db` (существующие данные не трогаются).
 
 Тип сообщения в чате (`intent.py`): `POST /ask` кроме ответа агента возвращает `intent` — вопрос,
 проблема, сводка, документ или новое знание (с баллами и сигналами, почему так) — и `issue_draft`,
 если это сообщение о проблеме: тема, описание, текст ошибки 1С, объекты, категория, приоритет.
 Решают эвристики; спорные случаи — модель (`COPILOT_INTENT_LLM`). `POST /classify` — то же без агента.
+
+База знаний из решённых обращений (`kb.py`): `kb-draft` готовит разбор «симптом → причина → решение»
+(модель `COPILOT_MODEL_BUSINESS_TEXT` по полям обращения или шаблон; без имён, e-mail и телефонов),
+`kb-publish` сохраняет его материалом «Решение ОБР-… — тема.md» — дальше обычный конвейер «Материалов».
 
 Разбор письма в обращение (`email_intake.py`, `POST /issues/from-email`): из .msg/.eml собирается
 вся цепочка (само письмо, цитаты, письма-вложения), инициатор — последний автор из своих доменов

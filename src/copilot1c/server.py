@@ -22,6 +22,8 @@
   GET   /issues/{id}/attachments/{aid} — файл вложения;
   GET   /issues/{id}/related, POST /issues/related (черновик) — похожие обращения (дубли) и связанные
         тест-кейсы ПиМИ и пункты ТЗ (related.py);
+  POST  /issues/{id}/kb-draft — разбор решённого обращения для базы знаний (kb.py), не сохраняется;
+  POST  /issues/{id}/kb-publish — разбор → материал «Решение ОБР-… — тема.md» (дальше — конвейер «Материалов»);
   POST  /issues/from-email — разбор письма (.msg/.eml) в черновик: инициатор, дата, тема, текст, цепочка;
         ничего не сохраняет. POST /issues/{id}/attachments с expand=true — письмо прикрепляется вместе
         с файлами, вложенными в него (скриншоты, логи);
@@ -225,6 +227,16 @@ class RelatedIn(BaseModel):
     description: str | None = None
     error_text: str | None = None
     objects: list[str] = Field(default_factory=list)
+
+
+class KbDraftIn(BaseModel):
+    use_llm: bool = True
+
+
+class KbPublishIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=50000)
+    actor: str | None = None
 
 
 class CommentIn(BaseModel):
@@ -470,6 +482,41 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             return _related_out(find_related(g.conn, s.project, req.model_dump()))
         finally:
             g.close()
+
+    @app.post("/issues/{issue_id}/kb-draft")
+    def issues_kb_draft(issue_id: int, req: KbDraftIn | None = None) -> dict[str, Any]:
+        from copilot1c.kb import compose
+
+        g, reg = _issues(s)
+        try:
+            issue = reg.get(issue_id)
+        finally:
+            g.close()
+        if issue is None:
+            raise HTTPException(404, "Обращение не найдено")
+        return _call(lambda: compose(issue, s, use_llm=(req.use_llm if req else True)))
+
+    @app.post("/issues/{issue_id}/kb-publish")
+    def issues_kb_publish(issue_id: int, req: KbPublishIn) -> dict[str, Any]:
+        """Сохраняет разбор материалом и ставит ссылку на него в обращение (kb_material_id + история)."""
+        from copilot1c.kb import publish
+        from copilot1c.materials import row_out
+
+        g, reg = _issues(s)
+        try:
+            issue = reg.get(issue_id)
+            if issue is None:
+                raise HTTPException(404, "Обращение не найдено")
+            material, seen = _call(lambda: publish(g.conn, s.project, issue, req.title, req.text,
+                                                   Path(s.materials_dir), base=Path.cwd(), analysts=s.analysts))
+            card = issue
+            if issue.get("kb_material_id") != material["id"]:
+                note = f"Разбор отправлен в базу знаний: «{material['filename']}»"
+                card = _call(lambda: reg.update(issue_id, {"kb_material_id": material["id"]}, issue["version"],
+                                                req.actor, comment=note))
+        finally:
+            g.close()
+        return {"material": {**row_out(material), "already_uploaded": seen}, "issue": card}
 
     @app.post("/issues/from-email")
     def issues_from_email(file: UploadFile = File(...)) -> dict[str, Any]:
