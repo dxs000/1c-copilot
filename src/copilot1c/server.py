@@ -10,17 +10,27 @@
   POST /materials — загрузить файлы (multipart, поле files): сохраняются в data/uploads, попадают в реестр.
   GET  /materials, GET /materials/{id} — реестр загруженных материалов и их статусы. Обработку
                (разбор → индексация → запись в базу) ведёт фоновый поток, см. worker.py.
+  Обращения (issues.py) — проблемы, которые заводят аналитики:
+  GET   /issues/meta — справочники (статусы, категории, приоритеты) и список аналитиков;
+  GET   /issues — список с фильтрами (status, priority, category, assignee, open, q);
+  POST  /issues — новое обращение (JSON); GET /issues/{id} — карточка с вложениями и историей;
+  PATCH /issues/{id} — правка полей с версией (409 при одновременной правке) и комментарием;
+  POST  /issues/{id}/comments, POST /issues/{id}/attachments (multipart files),
+  GET   /issues/{id}/attachments/{aid} — файл вложения;
+  GET   /contacts?q=, POST /contacts — инициаторы обращений (сотрудники заказчика).
 """
 
 from __future__ import annotations
 
 import json
 import time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from copilot1c import __version__
 from copilot1c.config import Settings, get_settings
@@ -115,6 +125,81 @@ def _registry(s: Settings):
     return g, MaterialRegistry(g.conn, s.project)
 
 
+class IssueFields(BaseModel):
+    """Поля обращения, которые задаёт клиент. Типы проверяет pydantic, значения справочников — issues.py."""
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(None, max_length=500)
+    description: str | None = None
+    summary: str | None = None
+    error_text: str | None = None
+    steps: str | None = None
+    expected: str | None = None
+    actual: str | None = None
+    category: str | None = None
+    priority: str | None = None
+    status: str | None = None
+    tags: list[str] | None = None
+    assignee: str | None = None
+    due_date: date | None = None
+    infobase: str | None = None
+    server: str | None = None
+    config_version: str | None = None
+    platform_version: str | None = None
+    objects: list[str] | None = None
+    initiator_contact_id: int | None = None
+    reported_at: datetime | None = None
+    registered_by: str | None = None
+    source: str | None = None
+    source_ref: str | None = None
+    source_message_id: str | None = None
+    classifier_confidence: float | None = None
+    duplicate_of: int | None = None
+    requirement_ids: list[str] | None = None
+    test_case_ids: list[str] | None = None
+    root_cause: str | None = None
+    resolution: str | None = None
+    kb_material_id: int | None = None
+
+
+class IssueCreate(IssueFields):
+    title: str = Field(min_length=1, max_length=500)
+    actor: str | None = None  # аналитик, от имени которого запись (идёт в историю и в registered_by)
+
+
+class IssuePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int
+    changes: IssueFields = Field(default_factory=IssueFields)
+    comment: str | None = None
+    actor: str | None = None
+
+
+class CommentIn(BaseModel):
+    text: str = Field(min_length=1, max_length=20000)
+    actor: str | None = None
+
+
+class ContactIn(BaseModel):
+    name: str = ""
+    email: str | None = None
+    organization: str | None = None
+    position: str | None = None
+    phone: str | None = None
+
+
+def _issues(s: Settings):
+    """Подключение к PostgreSQL и реестр обращений; 503, если базы нет."""
+    from copilot1c.graph.store import try_connect
+    from copilot1c.issues import IssueRegistry
+
+    g = try_connect(s)
+    if g is None:
+        raise HTTPException(503, "PostgreSQL недоступен — обращения не работают")
+    return g, IssueRegistry(g.conn, s.project, Path(s.issues_dir), base=Path.cwd())
+
+
 def create_app(settings: Settings | None = None, start_worker: bool = False) -> FastAPI:
     """start_worker — запустить фоновую обработку загруженных материалов (так делает copilot1c serve)."""
     from contextlib import asynccontextmanager
@@ -202,5 +287,137 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         if row is None:
             raise HTTPException(404, "Материал не найден")
         return row_out(row)
+
+    # ---------- обращения ----------
+    # Ошибки данных (неизвестный статус, пустая тема) — 422 с текстом; обращения нет — 404;
+    # обращение изменили после открытия — 409 и актуальная карточка в detail.current.
+
+    def _call(fn):
+        from copilot1c.issues import IssueError, VersionConflict
+
+        try:
+            return fn()
+        except IssueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except VersionConflict as exc:
+            raise HTTPException(409, {"message": str(exc), "current": exc.current}) from exc
+
+    @app.get("/issues/meta")
+    def issues_meta() -> dict[str, Any]:
+        from copilot1c.issues import meta
+
+        return meta(s.analysts)
+
+    @app.get("/issues")
+    def issues_list(status: str | None = None, priority: str | None = None, category: str | None = None,
+                    assignee: str | None = None, open: bool = False, q: str | None = None,
+                    limit: int = 200) -> dict[str, Any]:
+        g, reg = _issues(s)
+        try:
+            return {"issues": reg.list(status, priority, category, assignee, q, open, min(max(limit, 1), 1000))}
+        finally:
+            g.close()
+
+    @app.post("/issues")
+    def issues_create(req: IssueCreate) -> dict[str, Any]:
+        g, reg = _issues(s)
+        try:
+            fields = req.model_dump(exclude_unset=True, exclude={"actor"})
+            issue, seen = _call(lambda: reg.create(fields, req.actor))
+        finally:
+            g.close()
+        return {**issue, "already_registered": seen}
+
+    @app.get("/issues/{issue_id}")
+    def issues_get(issue_id: int) -> dict[str, Any]:
+        g, reg = _issues(s)
+        try:
+            issue = reg.get(issue_id)
+        finally:
+            g.close()
+        if issue is None:
+            raise HTTPException(404, "Обращение не найдено")
+        return issue
+
+    @app.patch("/issues/{issue_id}")
+    def issues_patch(issue_id: int, req: IssuePatch) -> dict[str, Any]:
+        g, reg = _issues(s)
+        try:
+            changes = req.changes.model_dump(exclude_unset=True)
+            issue = _call(lambda: reg.update(issue_id, changes, req.version, req.actor, req.comment))
+        finally:
+            g.close()
+        if issue is None:
+            raise HTTPException(404, "Обращение не найдено")
+        return issue
+
+    @app.post("/issues/{issue_id}/comments")
+    def issues_comment(issue_id: int, req: CommentIn) -> dict[str, Any]:
+        g, reg = _issues(s)
+        try:
+            issue = _call(lambda: reg.add_comment(issue_id, req.text, req.actor))
+        finally:
+            g.close()
+        if issue is None:
+            raise HTTPException(404, "Обращение не найдено")
+        return issue
+
+    @app.post("/issues/{issue_id}/attachments")
+    def issues_attach(issue_id: int, files: list[UploadFile] = File(...),
+                      actor: str | None = Form(None)) -> dict[str, Any]:
+        from copilot1c.materials import MAX_UPLOAD_BYTES
+
+        g, reg = _issues(s)
+        out = []
+        try:
+            for f in files:
+                data = f.file.read(MAX_UPLOAD_BYTES + 1)
+                name = f.filename or "файл"
+                if len(data) > MAX_UPLOAD_BYTES:
+                    out.append({"filename": name, "error": f"файл больше {MAX_UPLOAD_BYTES // 2**20} МБ — не сохранён"})
+                    continue
+                if not data:
+                    out.append({"filename": name, "error": "пустой файл — не сохранён"})
+                    continue
+                res = reg.add_attachment(issue_id, name, data, actor)
+                if res is None:
+                    raise HTTPException(404, "Обращение не найдено")
+                att, seen = res
+                out.append({**att, "already_attached": seen})
+        finally:
+            g.close()
+        return {"attachments": out}
+
+    @app.get("/issues/{issue_id}/attachments/{attachment_id}")
+    def issues_attachment(issue_id: int, attachment_id: int):
+        g, reg = _issues(s)
+        try:
+            att = reg.attachment(issue_id, attachment_id)
+        finally:
+            g.close()
+        if att is None:
+            raise HTTPException(404, "Вложение не найдено")
+        path = Path(att["path"])
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise HTTPException(410, "Файл вложения отсутствует на диске")
+        return FileResponse(path, media_type=att["mime"] or "application/octet-stream", filename=att["filename"])
+
+    @app.get("/contacts")
+    def contacts(q: str | None = None, limit: int = 50) -> dict[str, Any]:
+        g, reg = _issues(s)
+        try:
+            return {"contacts": reg.contacts(q, min(max(limit, 1), 500))}
+        finally:
+            g.close()
+
+    @app.post("/contacts")
+    def contacts_upsert(req: ContactIn) -> dict[str, Any]:
+        g, reg = _issues(s)
+        try:
+            return _call(lambda: reg.upsert_contact(req.name, req.email, req.organization, req.position, req.phone))
+        finally:
+            g.close()
 
     return app

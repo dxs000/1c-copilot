@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # Материалы проекта (корпус) и куда демон сохраняет загруженные через веб
     corpus_dir: str = "data"
     materials_dir: str = "data/uploads"
+    # Обращения: вложения хранятся в <issues_dir>/<id>/ — вне data, чтобы не попасть в индекс.
+    # Аналитики интегратора — для полей «кто завёл» и «ответственный» (в .env JSON-списком:
+    # COPILOT_ANALYSTS='["Иванов И.", "Петрова А."]'); пустой список — имя вводится вручную.
+    issues_dir: str = "issues"
+    analysts: tuple[str, ...] = ()
     # Конвертация старых форматов (.doc, .xls, .rtf, .odt) через LibreOffice
     soffice_bin: str = "soffice"
 

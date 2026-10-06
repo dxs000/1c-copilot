@@ -46,7 +46,7 @@ def pg_settings(tmp_path, monkeypatch):
                  yc_api_key="", yc_folder_id="", onec_bin="/nonexistent")
     g = GraphStore(settings=s)
     g.init_schema()
-    g.conn.execute("TRUNCATE materials RESTART IDENTITY")
+    g.conn.execute("TRUNCATE materials RESTART IDENTITY CASCADE")  # CASCADE: на materials ссылаются обращения
     g.conn.commit()
     g.close()
     monkeypatch.chdir(tmp_path)  # демон работает в каталоге ядра: data/uploads — относительно него

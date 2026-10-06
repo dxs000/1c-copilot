@@ -53,6 +53,7 @@ RAG-системы для 1С на Yandex Cloud AI».
 | `index/yandex.py` | AI Studio через OpenAI-совместимый API: эмбеддинги, structured output, Vector Store |
 | `graph/*` | Граф сущностей и реестры в PostgreSQL |
 | `agent/tools.py` | Инструменты агента и цикл function calling |
+| `issues.py` | Обращения, контакты-инициаторы, вложения и история |
 
 ## Быстрый старт
 
@@ -102,6 +103,19 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now copilot1c-core
 journalctl -u copilot1c-core -f
 ```
+
+### Обращения
+
+Проблемы, о которых сообщают аналитики интегратора, ведутся в PostgreSQL (`issues.py`):
+`issues` — обращения (суть, классификация, статус, окружение, инициатор, связи, итог, `version`
+против одновременной правки), `contacts` — инициаторы (сотрудники заказчика, уникальны по e-mail),
+`issue_attachments` — вложения (файлы в `issues/<id>/`, вне `data` — в индекс не попадают),
+`issue_events` — история: создание, правка каждого поля, смена статуса, комментарии, вложения.
+
+Методы демона: `GET /issues/meta`, `GET|POST /issues`, `GET|PATCH /issues/{id}`,
+`POST /issues/{id}/comments`, `POST /issues/{id}/attachments`, `GET /issues/{id}/attachments/{aid}`,
+`GET|POST /contacts`. Список аналитиков — `COPILOT_ANALYSTS` в `.env` (JSON-список).
+После обновления ядра таблицы создаются командой `copilot1c init-db` (существующие данные не трогаются).
 
 ## Оценка качества
 

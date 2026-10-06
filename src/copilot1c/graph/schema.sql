@@ -152,3 +152,101 @@ CREATE TABLE IF NOT EXISTS materials (
     UNIQUE (project, sha256)
 );
 CREATE INDEX IF NOT EXISTS materials_status_idx ON materials (status, id);
+
+-- ===== Обращения (проблемы, о которых сообщают аналитики интегратора) =====
+-- Заводят обращения только аналитики интегратора (через веб или чат). Пользователи заказчика с системой
+-- не работают: они — инициаторы проблем и хранятся в contacts (обычно извлекаются из приложенного письма).
+
+-- Контакты: люди заказчика (и при необходимости интегратора), от которых приходят обращения
+CREATE TABLE IF NOT EXISTS contacts (
+    id            bigserial PRIMARY KEY,
+    name          text NOT NULL,
+    email         text,                   -- уникален без учёта регистра; может отсутствовать
+    organization  text,
+    position      text,                   -- должность из подписи письма
+    phone         text,
+    entity_key    text,                   -- сущность графа (participant:…), если человек уже известен по переписке
+    first_seen    timestamptz NOT NULL DEFAULT now(),
+    last_seen     timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS contacts_email_idx ON contacts (lower(email)) WHERE email IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS issues (
+    id                     bigserial PRIMARY KEY,   -- номер для людей: ОБР-0001 (формируется из id)
+    project                text NOT NULL,
+    title                  text NOT NULL,
+    -- суть проблемы
+    description            text,                    -- исходный текст обращения
+    summary                text,                    -- краткое описание (позже — от модели)
+    error_text             text,                    -- текст ошибки 1С, как есть
+    steps                  text,                    -- шаги воспроизведения
+    expected               text,
+    actual                 text,
+    -- классификация и работа
+    category               text NOT NULL DEFAULT 'bug',
+    priority               text NOT NULL DEFAULT 'medium',
+    status                 text NOT NULL DEFAULT 'new',
+    tags                   text[] NOT NULL DEFAULT '{}',
+    assignee               text,                    -- аналитик из COPILOT_ANALYSTS
+    due_date               date,
+    -- окружение
+    infobase               text,                    -- рабочая / тестовая / имя базы
+    server                 text,
+    config_version         text,
+    platform_version       text,
+    objects                text[] NOT NULL DEFAULT '{}',   -- объекты метаданных
+    -- происхождение
+    initiator_contact_id   bigint REFERENCES contacts(id) ON DELETE SET NULL,
+    reported_at            timestamptz,             -- когда сообщил заказчик (дата письма), не дата регистрации
+    registered_by          text,                    -- аналитик, заведший обращение
+    source                 text NOT NULL DEFAULT 'manual',  -- manual / chat / email
+    source_ref             text,                    -- запись журнала вопросов, путь к письму…
+    source_message_id      text,                    -- Message-ID письма: повторно приложенное письмо не даёт дубля
+    classifier_confidence  real,
+    -- связи
+    duplicate_of           bigint REFERENCES issues(id) ON DELETE SET NULL,
+    requirement_ids        text[] NOT NULL DEFAULT '{}',
+    test_case_ids          text[] NOT NULL DEFAULT '{}',   -- № тест-кейсов ПиМИ
+    -- итог
+    root_cause             text,
+    resolution             text,
+    resolved_at            timestamptz,
+    kb_material_id         bigint REFERENCES materials(id) ON DELETE SET NULL,  -- разбор, отправленный в базу знаний
+    -- служебное
+    version                int NOT NULL DEFAULT 1,  -- защита от одновременной правки двумя аналитиками
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS issues_status_idx ON issues (project, status, id);
+CREATE INDEX IF NOT EXISTS issues_objects_idx ON issues USING gin (objects);
+CREATE UNIQUE INDEX IF NOT EXISTS issues_message_idx ON issues (project, source_message_id)
+    WHERE source_message_id IS NOT NULL;
+
+-- Вложения обращений: скриншоты, логи, письма. В индекс (Vector Store) не попадают.
+CREATE TABLE IF NOT EXISTS issue_attachments (
+    id              bigserial PRIMARY KEY,
+    issue_id        bigint NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    filename        text NOT NULL,
+    path            text NOT NULL,                  -- относительно рабочего каталога ядра
+    mime            text,
+    size            bigint NOT NULL,
+    sha256          text NOT NULL,
+    extracted_text  text,                           -- OCR скриншота, текст лога (заполняется позже)
+    uploaded_by     text,
+    uploaded_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (issue_id, sha256)
+);
+
+-- История обращения: каждое создание, правка поля, смена статуса, комментарий, вложение
+CREATE TABLE IF NOT EXISTS issue_events (
+    id         bigserial PRIMARY KEY,
+    issue_id   bigint NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    at         timestamptz NOT NULL DEFAULT now(),
+    actor      text,                                -- аналитик или «агент»
+    type       text NOT NULL,                       -- created / field / status / comment / attachment
+    field      text,
+    old_value  jsonb,
+    new_value  jsonb,
+    comment    text
+);
+CREATE INDEX IF NOT EXISTS issue_events_issue_idx ON issue_events (issue_id, id);
