@@ -71,6 +71,10 @@ class IssueError(ValueError):
     """Неверные данные обращения (неизвестный статус, пустая тема…) — клиенту 422 с текстом."""
 
 
+class StorageError(Exception):
+    """Папка вложений недоступна для записи (чаще всего — не добавлена в ReadWritePaths службы)."""
+
+
 class VersionConflict(Exception):
     """Обращение изменили после того, как клиент его открыл."""
 
@@ -347,7 +351,13 @@ class IssueRegistry:
         if existing is not None:
             self.conn.commit()
             return _out(existing), True
-        path = _save(self.files_root / str(issue_id), filename, data)
+        try:
+            path = _save(self.files_root / str(issue_id), filename, data)
+        except OSError as exc:
+            self.conn.rollback()
+            raise StorageError(f"Не удалось сохранить файл в папку вложений {self.files_root.resolve()}: "
+                               f"{exc.strerror or exc}. Для службы copilot1c-core папка должна быть в "
+                               "ReadWritePaths (deploy/copilot1c-core.service)") from exc
         rel = path.relative_to(self.base) if self.base and path.is_relative_to(self.base) else path
         name = safe_filename(filename)
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"

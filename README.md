@@ -99,11 +99,15 @@ curl -s http://127.0.0.1:8100/health   # AI Studio, индекс и манифе
 На хосте — служба systemd `deploy/copilot1c-core.service` (пользователь `copilot`, каталог `/opt/1c-copilot`):
 
 ```bash
-sudo cp deploy/copilot1c-core.service /etc/systemd/system/
+sudo cp deploy/copilot1c-core.service /etc/systemd/system/   # и после каждого его изменения
 sudo systemctl daemon-reload
 sudo systemctl enable --now copilot1c-core
 journalctl -u copilot1c-core -f
 ```
+
+Служба работает в песочнице (`ProtectSystem=strict`): писать можно только в `.cache`, `data` и `issues`
+(вложения обращений) — список `ReadWritePaths` в файле службы. Папка, в которую ядро начинает писать,
+добавляется туда же; `GET /health` показывает, доступна ли папка вложений (`checks.issues_files`).
 
 ### Обращения
 

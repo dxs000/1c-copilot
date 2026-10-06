@@ -208,3 +208,25 @@ def test_unexpected_error_has_text_detail(monkeypatch):
     c = TestClient(server.create_app(Settings()), raise_server_exceptions=False)
     r = c.get("/issues")
     assert r.status_code == 500 and "RuntimeError: что-то сломалось" in r.json()["detail"]
+
+
+@needs_pg
+def test_readonly_attachments_folder_is_clear_503(client, monkeypatch):
+    # служба без папки в ReadWritePaths: раньше — голый 500, теперь — 503 с причиной и подсказкой
+    def readonly(*a, **kw):
+        raise OSError(30, "Read-only file system", "issues")
+
+    monkeypatch.setattr(iss, "_save", readonly)
+    iid = client.post("/issues", json={"title": "x"}).json()["id"]
+    r = client.post(f"/issues/{iid}/attachments", files=[("files", ("a.txt", b"x", "text/plain"))])
+    assert r.status_code == 503 and "Read-only file system" in r.json()["detail"] and "ReadWritePaths" in r.json()["detail"]
+    assert client.get(f"/issues/{iid}").json()["attachments"] == []  # записи о файле без файла не остаётся
+
+
+def test_health_reports_attachments_folder(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_check_postgres", lambda s: {"ok": True})
+    monkeypatch.chdir(tmp_path)
+    s = Settings(issues_dir="issues", onec_bin="/nonexistent", ocr_backend="none", cache_dir=str(tmp_path))
+    h = TestClient(server.create_app(s)).get("/health").json()
+    assert h["checks"]["issues_files"]["ok"] is True and (tmp_path / "issues").is_dir()
+    assert not list((tmp_path / "issues").iterdir())  # пробный файл удалён

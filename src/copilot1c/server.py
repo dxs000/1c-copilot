@@ -67,6 +67,21 @@ def _manifest_chunks(path: Path) -> int:
         return 0
 
 
+def _check_writable(folder: Path) -> dict[str, Any]:
+    """Можно ли писать вложения обращений: папка создаётся, пробный файл пишется и удаляется."""
+    import os
+
+    path = folder if folder.is_absolute() else Path.cwd() / folder
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".write-test-{os.getpid()}"
+        probe.write_bytes(b"")
+        probe.unlink()
+        return {"ok": True, "path": str(path), "optional": True}
+    except OSError as exc:
+        return {"ok": False, "path": str(path), "optional": True, "detail": exc.strerror or str(exc)}
+
+
 def health_report(s: Settings) -> dict[str, Any]:
     from copilot1c.ingest.ocr import backend
 
@@ -80,6 +95,7 @@ def health_report(s: Settings) -> dict[str, Any]:
         "postgres": {**_check_postgres(s), "host": s.pg_dsn.rsplit("@", 1)[-1]},  # без логина и пароля
         "platform_1c": {"ok": Path(s.onec_bin).exists(), "optional": True},
         "ocr": {"ok": True, "backend": backend(s), "optional": True},
+        "issues_files": _check_writable(Path(s.issues_dir)),
     }
     required_ok = all(checks[k]["ok"] for k in ("ai_studio", "vector_store", "postgres"))
     return {"status": "ok" if required_ok else "degraded", "version": __version__, "project": s.project,
@@ -314,10 +330,12 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
     # обращение изменили после открытия — 409 и актуальная карточка в detail.current.
 
     def _call(fn):
-        from copilot1c.issues import IssueError, VersionConflict
+        from copilot1c.issues import IssueError, StorageError, VersionConflict
 
         try:
             return fn()
+        except StorageError as exc:
+            raise HTTPException(503, str(exc)) from exc
         except IssueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except VersionConflict as exc:
@@ -427,7 +445,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         out = []
 
         def attach(name: str, data: bytes, inner_of: str | None = None) -> None:
-            res = reg.add_attachment(issue_id, name, data, actor)
+            res = _call(lambda: reg.add_attachment(issue_id, name, data, actor))
             if res is None:
                 raise HTTPException(404, "Обращение не найдено")
             att, seen = res
