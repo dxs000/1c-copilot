@@ -45,6 +45,25 @@ def test_heuristics_on_labeled_messages(text, primary, issue):
     assert r.is_issue is issue, (r.scores, r.signals)
 
 
+# с приложенными файлами: (сообщение, главный тип, предлагать ли обращение)
+CASES_WITH_FILES = [
+    ("Просмотреть предложенные документы при необходимости добавить в хранилище", "intake", False),
+    ("Добавь эти файлы в базу", "intake", False),
+    ("Сохрани в материалы проекта", "intake", False),
+    ("Разбери присланные документы по командировкам", "intake", False),
+    ("Что в этих документах про учет билетов?", "question", False),
+    ("Не открывается форма заказа, скриншот приложен", "issue", True),
+]
+
+
+@pytest.mark.parametrize(("text", "primary", "issue"), CASES_WITH_FILES, ids=[c[0][:40] for c in CASES_WITH_FILES])
+def test_heuristics_with_files(text, primary, issue):
+    r = it.heuristics(text, has_files=True)
+    assert r.primary == primary, (r.primary, r.scores, r.signals)
+    assert r.is_issue is issue, (r.scores, r.signals)
+    assert r.primary != "intake" or r.confident  # «принять в базу» — без вызова модели
+
+
 def test_signals_explain_decision_and_files_count():
     r = it.heuristics("Не открывается форма заказа", has_files=True)
     assert r.is_issue and any("приложены файлы" in s for s in r.signals)

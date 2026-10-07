@@ -506,9 +506,10 @@ def agent_view(results: list[ChainResult], full_limit: int = 12000) -> str:
 # ---------- запись писем из файлов (worker, index-docs) ----------
 
 def ingest_emails(conn, settings, emails: list[ParsedEmail], index, material_id: int | None = None,
-                  summaries: bool = True) -> list[ChainResult]:
+                  summaries: bool = True, contours: list[int] | None = None) -> list[ChainResult]:
     """Письма-файлы → письма и ветки; фрагменты только новых писем → база поиска (с контурами ветки);
-    сводки веток, где появились новые письма. Возвращает результаты по цепочкам."""
+    сводки веток, где появились новые письма. contours — решение аналитика: добавляются к контурам веток.
+    Возвращает результаты по цепочкам."""
     store = LetterStore(conn, settings.project)
     results: list[ChainResult] = []
     for e in emails:
@@ -517,6 +518,11 @@ def ingest_emails(conn, settings, emails: list[ParsedEmail], index, material_id:
     for r in results:
         for x in r.new_letters:
             touched.setdefault(r.thread_id, []).append(x.chunk)
+    if contours:
+        for tid in {r.thread_id for r in results if r.thread_id}:
+            row = store._rows("SELECT contours FROM threads WHERE id = %s", (tid,))
+            merged = sorted(set((row[0]["contours"] if row else None) or []) | set(contours))
+            store.update(tid, {"contours": merged})
     for tid, chunks in touched.items():
         contours = store._rows("SELECT contours FROM threads WHERE id = %s", (tid,))
         index.add(chunks, material_id=material_id, contours=(contours[0]["contours"] if contours else None) or ())
@@ -537,12 +543,13 @@ def ingest_emails(conn, settings, emails: list[ParsedEmail], index, material_id:
 
 
 def results_report(results: list[ChainResult]) -> dict[str, Any]:
-    threads: dict[int, dict[str, Any]] = {}
+    threads: dict[Any, dict[str, Any]] = {}
     for r in results:
-        if r.thread_id is None:
+        if not r.letters:
             continue
-        t = threads.setdefault(r.thread_id, {"id": r.thread_id, "title": r.thread_title, "new": 0, "known": 0,
-                                             "issue_id": r.issue_id})
+        key = r.thread_id if r.thread_id is not None else f"new:{r.thread_title}"  # новая ветка (пробный прогон)
+        t = threads.setdefault(key, {"id": r.thread_id, "title": r.thread_title, "new": 0, "known": 0,
+                                     "issue_id": r.issue_id})
         t["new"] += len(r.new_letters)
         t["known"] += len(r.letters) - len(r.new_letters)
     return {"letters_new": sum(t["new"] for t in threads.values()),

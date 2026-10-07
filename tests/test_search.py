@@ -205,3 +205,17 @@ def test_index_docs_without_postgres(monkeypatch, tmp_path):
     (tmp_path / "note.txt").write_text("ДС № 10 на обновление УТ 11.5.27.75", encoding="utf-8")
     result = CliRunner().invoke(cli.app, ["index-docs", str(tmp_path / "note.txt")])
     assert result.exit_code == 1 and "PostgreSQL недоступен" in result.output
+
+
+@needs_pg
+def test_contour_match_handles_word_endings(pg):
+    from copilot1c.contours import ContourRegistry
+
+    s, g = pg
+    reg = ContourRegistry(g.conn, s.project)
+    reg.create({"kind": "process", "name": "Командировки"})
+    reg.create({"kind": "system", "name": "УТ 11", "aliases": ["Управление торговлей"]})
+    names = lambda t: sorted(c["name"] for c in reg.match(t))  # noqa: E731
+    assert names("Описание процесса командировок и учета билетов") == ["Командировки"]
+    assert names("Обновление УТ 11.5.27.75, «Управлении торговлей»") == ["УТ 11"]
+    assert names("УТ 111 и командир") == []

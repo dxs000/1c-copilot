@@ -28,6 +28,7 @@ STATUS_LABELS = {
     "duplicate": "уже есть",
     "error": "ошибка",
     "deleted": "удалён",
+    "archived": "сохранён без индексации",
 }
 ACTIVE = ("queued", "parsing", "indexing", "graph")
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # как предел разбора одного файла в ingest.attachments
@@ -80,10 +81,12 @@ class MaterialRegistry:
         self.conn.commit()
         return row
 
-    def add(self, filename: str, path: str, sha256: str, size: int) -> dict[str, Any]:
+    def add(self, filename: str, path: str, sha256: str, size: int, decision: dict[str, Any] | None = None,
+            status: str = "queued") -> dict[str, Any]:
         with self.conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("INSERT INTO materials (project, filename, path, sha256, size) VALUES (%s, %s, %s, %s, %s) "
-                        "RETURNING *", (self.project, filename, path, sha256, size))
+            cur.execute("INSERT INTO materials (project, filename, path, sha256, size, decision, status) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                        (self.project, filename, path, sha256, size, Jsonb(decision or {}), status))
             row = cur.fetchone()
         self.conn.commit()
         return row
@@ -114,15 +117,21 @@ class MaterialRegistry:
 
 
 def register_upload(registry: MaterialRegistry, root: Path, filename: str, data: bytes,
-                    base: Path | None = None) -> tuple[dict[str, Any], bool]:
-    """Сохраняет файл и добавляет в реестр. Возвращает (запись, загружен_раньше)."""
+                    base: Path | None = None, decision: dict[str, Any] | None = None,
+                    status: str = "queued") -> tuple[dict[str, Any], bool]:
+    """Сохраняет файл и добавляет в реестр (сразу с решением аналитика, чтобы обработчик не взял файл без
+    него). Возвращает (запись, загружен_раньше)."""
     sha = hashlib.sha256(data).hexdigest()
     existing = registry.find_sha(sha)
-    if existing is not None and existing["status"] == "deleted":  # удалённый из базы загружают снова — в очередь
-        registry.set_status(existing["id"], "queued", "загружен повторно после удаления")
+    if existing is not None and existing["status"] in ("deleted", "archived") and status != "archived":
+        # удалённый из базы или сохранённый без индексации теперь добавляют — в очередь с новым решением
+        with registry.conn.cursor() as cur:
+            cur.execute("UPDATE materials SET decision = %s WHERE id = %s", (Jsonb(decision or {}), existing["id"]))
+        registry.set_status(existing["id"], "queued", "загружен повторно после удаления"
+                            if existing["status"] == "deleted" else "добавлен в базу после сохранения без индексации")
         return registry.get(existing["id"]), False
     if existing is not None:
         return existing, True
     path = save_upload(root, filename, data)
     rel = path.relative_to(base) if base and path.is_relative_to(base) else path
-    return registry.add(safe_filename(filename), rel.as_posix(), sha, len(data)), False
+    return registry.add(safe_filename(filename), rel.as_posix(), sha, len(data), decision, status), False

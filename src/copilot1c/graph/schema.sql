@@ -1,6 +1,13 @@
 -- Граф знаний, реестры и база поиска «1С Project Copilot» (PostgreSQL + pgvector)
 -- Поиск идёт в PostgreSQL (search.py): без pgvector ядро не работает.
-CREATE EXTENSION IF NOT EXISTS vector;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        CREATE EXTENSION vector;
+    END IF;
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE EXCEPTION 'Расширение pgvector не создано: нужен суперпользователь PostgreSQL'
+        USING HINT = 'Один раз: sudo -u postgres psql -d ' || current_database() || ' -c "CREATE EXTENSION IF NOT EXISTS vector;" — затем снова copilot1c init-db';
+END $$;
 
 -- Фрагменты базы проекта: единица поиска. status: active — в поиске; superseded — заменён новой редакцией
 -- (в поиск по умолчанию не попадает). contours — контуры (система / процесс / проект), к которым относится
@@ -167,9 +174,15 @@ CREATE TABLE IF NOT EXISTS materials (
     uploaded_at  timestamptz NOT NULL DEFAULT now(),
     started_at   timestamptz,
     finished_at  timestamptz,
+    decision     jsonb NOT NULL DEFAULT '{}',  -- решение аналитика при приёме: действие, контуры, документ
     UNIQUE (project, sha256)
 );
 CREATE INDEX IF NOT EXISTS materials_status_idx ON materials (status, id);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'materials' AND column_name = 'decision') THEN
+        ALTER TABLE materials ADD COLUMN decision jsonb NOT NULL DEFAULT '{}';
+    END IF;
+END $$;
 
 -- Контуры: к чему относится материал — система (УТ 11, БП 3.0…), процесс или тема (командировки, НСИ…),
 -- проект (обновление УТ 11 до 11.5.27.75). Справочник ведут аналитики; notes — предметные пояснения для
@@ -331,3 +344,35 @@ CREATE TABLE IF NOT EXISTS letters (
 CREATE UNIQUE INDEX IF NOT EXISTS letters_message_idx ON letters (project, message_id) WHERE message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS letters_sender_idx ON letters (project, sender_key, sent_at);
 CREATE INDEX IF NOT EXISTS letters_thread_idx ON letters (thread_id, sent_at);
+
+-- ===== Документы и редакции =====
+-- Документ — логическая единица («ТЗ на командировки»), редакция — конкретный файл его содержания. Новая
+-- редакция становится текущей, фрагменты прежней получают status = 'superseded' и выходят из поиска по
+-- умолчанию. Фрагменты редакции помечены attrs.document_id и attrs.version_id.
+CREATE TABLE IF NOT EXISTS documents (
+    id                  bigserial PRIMARY KEY,
+    project             text NOT NULL,
+    title               text NOT NULL,
+    kind                text NOT NULL DEFAULT 'other',
+    contours            bigint[] NOT NULL DEFAULT '{}',
+    current_version_id  bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS documents_project_idx ON documents (project, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS document_versions (
+    id             bigserial PRIMARY KEY,
+    document_id    bigint NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    material_id    bigint REFERENCES materials(id) ON DELETE SET NULL,
+    source         text NOT NULL,
+    filename       text,
+    version_label  text,
+    doc_date       date,
+    fingerprint    text NOT NULL,
+    status         text NOT NULL DEFAULT 'current',   -- current | superseded
+    chunks         int NOT NULL DEFAULT 0,
+    added_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS document_versions_doc_idx ON document_versions (document_id, id);
+CREATE INDEX IF NOT EXISTS document_versions_fp_idx ON document_versions (fingerprint);

@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     intent_llm: bool = True
     # Сводка ветки переписки (проблема, сделано, ждём, статус) — моделью model_batch; false — шаблоном
     thread_summary_llm: bool = True
+    # Разбор входящих (вид документа, о чём, контуры) — моделью model_batch; false — только эвристики
+    intake_llm: bool = True
     # Поиск в интернете для агента (Yandex Search API v2, ключ AI Studio): выключатель, лимиты на один вопрос,
     # запрещённые для отправки слова сверх своих доменов и аналитиков (название заказчика и т. п.)
     web_search: bool = True

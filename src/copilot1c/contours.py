@@ -121,14 +121,40 @@ class ContourRegistry:
         return _out(rows[0])
 
     def match(self, text: str) -> list[dict[str, Any]]:
-        """Контуры, названные в тексте по имени или псевдониму (целым словом, без учёта регистра)."""
-        import re
-
-        low = text.casefold()
+        """Контуры, названные в тексте по имени или псевдониму — с учётом окончаний: «Командировки» находит
+        «командировок» и «командировочные»; «БП 3.0» и «УТ11» — как есть (короткие слова и числа — целиком)."""
+        words = _tokens(text)
         found = []
         for c in self.list():
-            for name in [c["name"], *c["aliases"]]:
-                if name and re.search(rf"(?<![\wЁё]){re.escape(name.casefold())}(?![\wЁё])", low):
-                    found.append(c)
-                    break
+            if any(_contains(words, _tokens(name)) for name in [c["name"], *c["aliases"]] if name):
+                found.append(c)
         return found
+
+
+def _tokens(text: str) -> list[str]:
+    import re
+
+    return re.findall(r"[0-9a-zа-яё]+(?:[.:][0-9a-zа-яё]+)*", (text or "").casefold().replace("ё", "е"))
+
+
+def _stem(word: str) -> str:
+    """Грубая основа: у длинных слов без цифр отбрасываются последние 2 буквы (окончание)."""
+    return word[:-2] if len(word) > 6 and word.isalpha() else word
+
+
+def _contains(words: list[str], name: list[str]) -> bool:
+    if not name:
+        return False
+    stems = [_stem(w) for w in name]
+    for i in range(len(words) - len(stems) + 1):
+        if all(_word_match(words[i + j], name[j], st) for j, st in enumerate(stems)):
+            return True
+    return False
+
+
+def _word_match(word: str, original: str, stem: str) -> bool:
+    if stem != original:  # длинное слово — по основе
+        return word.startswith(stem)
+    if original.isdigit():  # «11» находит и «11.5.27.75»
+        return word == original or word.startswith(original + ".")
+    return word == original

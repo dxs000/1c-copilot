@@ -19,7 +19,12 @@ from copilot1c.graph.store import GraphStore
 from copilot1c.index.yandex import client
 from copilot1c.retrieval import format_hits, smart_search
 
-SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта внедрения 1С. Отвечай по-русски, коротко и по делу.
+SYSTEM_PROMPT = """Ты — 1С Project Copilot, помощник аналитиков ИТ по системам 1С. Отвечай по-русски, коротко и по делу.
+
+Система. Ты работаешь внутри базы знаний Copilot: переписка, ТЗ, требования, описания процессов, ПиМИ,
+обращения. «База», «хранилище», «материалы» в сообщениях аналитика — это база этой системы, а не модуль 1С.
+Материалы добавляет аналитик через карточку разбора («Входящие» или карточка под ответом в чате); ты сам ничего
+не добавляешь и не придумываешь инструкций чужих программ. Если в сообщении есть «Задача» — выполняй её.
 
 Источники. Каждое утверждение подкрепляй источником в человекочитаемом виде — так, как он указан в
 поле «источник» найденного фрагмента: письмо (тема, дата, автор), документ (название, редакция,
@@ -291,11 +296,13 @@ def available_tools(ctx: ToolContext) -> list[dict]:
 
 
 def _prefetch_message(question: str, ctx: ToolContext, k: int, attached: str = "",
-                      search_query: str | None = None) -> str:
+                      search_query: str | None = None, task: str = "") -> str:
     """Поиск до первого вызова модели: на простые вопросы она отвечает сразу, без цикла инструментов.
     attached — текст файлов, приложенных к вопросу в чате; search_query — запрос для поиска, если он
     должен отличаться от вопроса (например, вопрос «что тут?» + тема приложенного письма)."""
     head = f"Вопрос: {question}"
+    if task:
+        head += f"\n\nЗадача: {task}"
     if attached:
         head += f"\n\nПриложено к вопросу (файлы аналитика, в базе проекта их нет):\n\n{attached}"
     if ctx.store is not None:  # упомянутые номера и возможные дубли — до первого вызова модели
@@ -318,12 +325,12 @@ def _prefetch_message(question: str, ctx: ToolContext, k: int, attached: str = "
 
 
 def run_agent(question: str, ctx: ToolContext, max_steps: int = 6, prefetch_k: int = 8, attached: str = "",
-              search_query: str | None = None) -> AgentResult:
+              search_query: str | None = None, task: str = "") -> AgentResult:
     """Цикл агента: предварительный поиск → модель с инструментами → обязательный финальный ответ."""
     s = ctx.settings or get_settings()
     handlers = make_handlers(ctx)
     tools = available_tools(ctx)
-    first = _prefetch_message(question, ctx, prefetch_k, attached, search_query)
+    first = _prefetch_message(question, ctx, prefetch_k, attached, search_query, task)
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT},
                                       {"role": "user", "content": first}]
     trace: list[dict] = []

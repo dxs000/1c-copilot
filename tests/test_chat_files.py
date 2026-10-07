@@ -44,7 +44,7 @@ def test_limits(monkeypatch):
 def test_ask_files_passes_context_and_email_issue_draft(monkeypatch):
     seen = {}
     monkeypatch.setattr(server, "search_sources", lambda s, q, k=8: seen.setdefault("search", q) and [])
-    monkeypatch.setattr(server, "run_question", lambda s, q, attached="", search_query=None: seen.update(
+    monkeypatch.setattr(server, "run_question", lambda s, q, attached="", search_query=None, task="": seen.update(
         q=q, attached=attached, sq=search_query) or SimpleNamespace(answer="Это ошибка КС_Гамма", steps=1, trace=[]))
     c = TestClient(server.create_app(_settings(pg_dsn="postgresql://nobody@127.0.0.1:1/x")))
     r = c.post("/ask/files", data={"question": "Что с этим делать?"},
@@ -83,7 +83,7 @@ def test_ask_files_knows_registered_email(monkeypatch):
     g.conn.commit()
     g.close()
     monkeypatch.setattr(server, "search_sources", lambda s, q, k=8: [])
-    monkeypatch.setattr(server, "run_question", lambda s, q, attached="", search_query=None:
+    monkeypatch.setattr(server, "run_question", lambda s, q, attached="", search_query=None, task="":
                         SimpleNamespace(answer="ок", steps=1, trace=[]))
     c = TestClient(server.create_app(s))
     issue = c.post("/issues", json={"title": "Реализация", "source_message_id": "<user-42@pierre-fabre.com>"}).json()

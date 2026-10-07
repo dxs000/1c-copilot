@@ -48,6 +48,11 @@ def recover(conn, project: str) -> int:
 
 
 def claim(conn, project: str, limit: int = BATCH_LIMIT) -> list[dict[str, Any]]:
+    """Пачка из очереди — в порядке загрузки (RETURNING порядок не гарантирует, а от него зависит склейка дублей)."""
+    return sorted(_claim(conn, project, limit), key=lambda r: r["id"])
+
+
+def _claim(conn, project: str, limit: int) -> list[dict[str, Any]]:
     return _rows(conn, """UPDATE materials SET status = 'parsing', detail = 'разбираю файл', started_at = now(),
                                                finished_at = NULL
                           WHERE id IN (SELECT id FROM materials WHERE project = %s AND status = 'queued'
@@ -77,6 +82,34 @@ def _where_already(corpus, path: str) -> list[str]:
     for d in corpus.documents:
         if any(_owned(a, path) for a in d.aliases) and not _owned(d.source, path):
             out.append(f"документ «{d.title[:100]}» — {Path(d.source.split('#')[0]).name}")
+    return out
+
+
+def _register_documents(conn, s: Settings, corpus, m: dict[str, Any], own: list, before: set[str],
+                        decision: dict[str, Any]) -> list[dict[str, Any]]:
+    """Документы, впервые пришедшие в этом материале, — в реестр документов и редакций. Решение аналитика
+    «новая редакция документа N» относится к первому документу файла; прежняя редакция выходит из поиска."""
+    from copilot1c.documents import DocumentRegistry, content_fingerprint, guess_kind
+
+    reg = DocumentRegistry(conn, s.project)
+    out = []
+    target = decision.get("document_id") if decision.get("action") == "new_version" else None
+    for d in corpus.documents:
+        if not _owned(d.source, m["path"]):
+            continue
+        ids = [c.chunk_id for c in own if c.source == d.source and c.chunk_id not in before]
+        if not ids:
+            continue  # содержание уже было в базе — редакция не новая
+        kind = decision.get("kind") if decision.get("kind") and target is None and len(out) == 0 else None
+        res = reg.add_version(title=(decision.get("title") if len(out) == 0 and decision.get("title") else d.title),
+                              kind=kind or (guess_kind(d.title, d.filename) if d.doc_type.value == "doc"
+                                            else d.doc_type.value),
+                              source=d.source, filename=d.filename, fingerprint=content_fingerprint(d), chunk_ids=ids,
+                              material_id=m["id"], version_label=d.version, doc_date=d.doc_date,
+                              contours=decision.get("contours") or [], document_id=target)
+        out.append({**res, "title": d.title[:200]})
+        target = None  # «новая редакция» — только для первого документа файла
+    conn.commit()
     return out
 
 
@@ -120,12 +153,17 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
             reg.set_status(m["id"], "indexing", f"записываю в базу поиска новые фрагменты: {own_new}" if own_new else
                            "новых фрагментов в файле нет — жду окончания обработки пачки")
         letters: dict[int, list] = {}
+        versions: dict[int, list[dict[str, Any]]] = {}
         for m in batch:  # фрагменты материала — с его id: по нему материал удаляется из базы
-            index.add([c for c in chunks if _owned(c.source, m["path"])], material_id=m["id"])
+            decision = m.get("decision") or {}
+            contours = decision.get("contours") or []
+            own = [c for c in chunks if _owned(c.source, m["path"])]
+            index.add(own, material_id=m["id"], contours=contours)
+            versions[m["id"]] = _register_documents(conn, s, corpus, m, own, before, decision)
             own_emails = [e for e in corpus.emails if _owned(e.source, m["path"])]
             if own_emails:
                 reg.set_status(m["id"], "indexing", "сверяю письма с известными ветками переписки")
-                letters[m["id"]] = ingest_emails(conn, s, own_emails, index, material_id=m["id"])
+                letters[m["id"]] = ingest_emails(conn, s, own_emails, index, material_id=m["id"], contours=contours)
         index.add(chunks)  # остальное (основные материалы data, прежние загрузки), если ещё не в базе
 
         for m in batch:
@@ -152,7 +190,8 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
         new = sum(c.chunk_id not in before for c in mine)
         mail = results_report(letters.get(m["id"], []))
         report = {**summary, "chunks": len(mine) + mail["letters_new"], "chunks_new": new + mail["letters_new"],
-                  "already_in_base": _where_already(corpus, m["path"]), **mail}
+                  "already_in_base": _where_already(corpus, m["path"]), **mail,
+                  "versions": versions.get(m["id"], []), "contours": (m.get("decision") or {}).get("contours", [])}
         threads = "; ".join(f"ветка «{t['title'][:80]}»: новых писем {t['new']}, известных {t['known']}"
                             for t in mail["threads"])
         if alone == 0:
@@ -166,6 +205,8 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
         else:
             parts = [f"добавлено фрагментов документов: {new} из {len(mine)}"] if mine else []
             parts += [threads] if threads else []
+            parts += [f"новая редакция «{v['title'][:80]}»: прежняя выведена из поиска ({v['superseded_chunks']} "
+                      "фрагментов)" for v in versions.get(m["id"], []) if v.get("superseded_versions")]
             reg.set_status(m["id"], "done", "; ".join(parts)[:500], report)
 
 

@@ -83,10 +83,17 @@ def unpack(file: Path, out_dir: Path, extension: str | None = typer.Option(None,
 @app.command("init-db")
 def init_db():
     """Создать схему графа и реестров в PostgreSQL."""
+    import psycopg
+
     from copilot1c.graph.store import GraphStore
 
-    with GraphStore() as g:
-        g.init_schema()
+    try:
+        with GraphStore() as g:
+            g.init_schema()
+    except psycopg.Error as exc:  # понятное сообщение вместо трассировки (например, нет прав на pgvector)
+        hint = getattr(exc.diag, "message_hint", None)
+        typer.echo(f"Схема не создана: {exc.diag.message_primary or exc}" + (f"\n{hint}" if hint else ""), err=True)
+        raise typer.Exit(1) from exc
     typer.echo("Схема создана")
 
 
@@ -147,7 +154,7 @@ def index_docs(paths: list[Path],
 
 
 KNOWLEDGE_TABLES = ("mentions", "relations", "entities", "requirement_tests", "requirements", "test_cases", "letters",
-                    "threads", "chunks", "bsl_calls", "bsl_methods", "md_objects")
+                    "threads", "document_versions", "documents", "chunks", "bsl_calls", "bsl_methods", "md_objects")
 
 
 @app.command("reset-knowledge")
@@ -156,7 +163,7 @@ def reset_knowledge(yes: bool = typer.Option(False, "--yes", help="Подтве�
     """Очистить базу знаний: фрагменты, письма и ветки, граф, реестры (и реестр загрузок). Обращения, контакты и
     контуры не трогаются."""
     if not yes:
-        typer.echo("Удалит все фрагменты, письма и ветки, граф, реестры тест-кейсов и требований"
+        typer.echo("Удалит все фрагменты, письма и ветки, документы и редакции, граф, реестры тест-кейсов и требований"
                    + (" и реестр загруженных материалов" if materials else "")
                    + ". Обращения, контакты и контуры останутся. Повторите с --yes.")
         raise typer.Exit(1)

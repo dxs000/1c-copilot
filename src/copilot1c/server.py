@@ -22,7 +22,12 @@
                (разбор → индексация → запись в базу) ведёт фоновый поток, см. worker.py.
   DELETE /materials/{id} — убрать фрагменты материала из базы поиска (файл и запись реестра остаются,
                статус «удалён»; повторная загрузка того же файла ставит его в очередь заново).
+  POST /materials/{id}/retry — материал с ошибкой снова в очередь.
   GET /contours, POST /contours, PATCH /contours/{id} — справочник контуров (система / процесс / проект).
+  POST /intake/analyze (multipart files) — «Входящие»: что это, к какому контуру, что уже в базе, что предложить
+               (intake.py; ничего не сохраняет); POST /intake/accept (files + decisions JSON) — приём по решению
+               аналитика: материалы в очередь или «без индексации», новые контуры — в справочник.
+  GET /documents?q=, GET /documents/{id} — документы и их редакции (documents.py).
   POST /letters/check (multipart files) — письма: что уже известно, что ново, к какой ветке (ничего не пишет);
   GET /threads?q=, GET /threads/{id} — ветки переписки и их письма; PATCH /threads/{id} — название, обращение,
                контуры; POST /threads/{id}/summary — пересобрать сводку ветки (letters.py).
@@ -187,15 +192,16 @@ def search_sources(s: Settings, question: str, k: int = 8) -> list[dict[str, Any
     return out
 
 
-def run_question(s: Settings, question: str, attached: str = "", search_query: str | None = None):
+def run_question(s: Settings, question: str, attached: str = "", search_query: str | None = None,
+                 task: str = ""):
     from copilot1c.agent.tools import ToolContext, run_agent
     from copilot1c.graph.store import try_connect
 
     store = try_connect(s)
     try:
         ctx = ToolContext(s, Path("data/dumps"), store)
-        if attached or search_query:
-            return run_agent(question, ctx, attached=attached, search_query=search_query)
+        if attached or search_query or task:
+            return run_agent(question, ctx, attached=attached, search_query=search_query, task=task)
         return run_agent(question, ctx)
     finally:
         if store is not None:
@@ -439,15 +445,28 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             kind["issue_draft"] = {**kind["issue_draft"], **email_info}
         subjects = " ".join(dict.fromkeys(e.subject for e in emails if e.subject))
         search_query = f"{question} {subjects}".strip() if subjects else None
+        intake, task = None, ""
+        if kind.get("intent", {}).get("primary") == "intake":  # «разбери и добавь в базу» — разбор приложенного
+            from copilot1c.intake import INTAKE_TASK, agent_block, analyze
+
+            g = try_connect(s)
+            try:
+                intake = analyze(raw, g.conn if g is not None else None, s)
+            finally:
+                if g is not None:
+                    g.conn.rollback()
+                    g.close()
+            task = f"{INTAKE_TASK}\n\nРазбор приложенного:\n{agent_block(intake)}"
         try:
             sources = search_sources(s, search_query or question)
-            result = run_question(s, question, attached, search_query)
+            result = run_question(s, question, attached, search_query, task)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(502, f"Ошибка поиска или Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
-                "attachments": [it.out() for it in items], "web_sources": getattr(result, "web_sources", []),
+                "attachments": [it.out() for it in items], "intake": intake,
+                "web_sources": getattr(result, "web_sources", []),
                 "escalation": getattr(result, "escalation", None), "issues": getattr(result, "issues", [])}
 
     @app.post("/escalations")
@@ -573,10 +592,33 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 raise HTTPException(404, "Материал не найден")
             if row["status"] in ACTIVE:
                 raise HTTPException(409, "Материал ещё обрабатывается — удалить можно после окончания")
+            from copilot1c.documents import forget_material
+
+            gone = forget_material(g.conn, material_id)
             removed = PgIndex(g.conn, s).delete_material(material_id)
             g.conn.commit()
-            reg.set_status(material_id, "deleted", f"удалено из базы фрагментов: {removed}")
-            return {"removed_chunks": removed, "material": row_out(reg.get(material_id))}
+            detail = f"удалено из базы фрагментов: {removed}" + (f", писем: {gone['letters']}" if gone["letters"] else "") \
+                + (f", редакций документов: {gone['versions']}" if gone["versions"] else "")
+            reg.set_status(material_id, "deleted", detail)
+            return {"removed_chunks": removed, **{f"removed_{k}": v for k, v in gone.items()},
+                    "material": row_out(reg.get(material_id))}
+        finally:
+            g.close()
+
+    @app.post("/materials/{material_id}/retry")
+    def material_retry(material_id: int) -> dict[str, Any]:
+        """Материал с ошибкой — снова в очередь (с тем же решением аналитика)."""
+        from copilot1c.materials import row_out
+
+        g, reg = _registry(s)
+        try:
+            row = reg.get(material_id)
+            if row is None:
+                raise HTTPException(404, "Материал не найден")
+            if row["status"] != "error":
+                raise HTTPException(409, "Повторить можно только материал с ошибкой")
+            reg.set_status(material_id, "queued", "повтор после ошибки")
+            return row_out(reg.get(material_id))
         finally:
             g.close()
 
@@ -616,6 +658,79 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             raise HTTPException(exc.status, str(exc)) from exc
         finally:
             g.close()
+
+    # ---------- «Входящие»: разбор и приём ----------
+
+    def _read_files(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+        from copilot1c.materials import MAX_UPLOAD_BYTES
+
+        out = []
+        for f in files:
+            data = f.file.read(MAX_UPLOAD_BYTES + 1)
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, f"Файл «{f.filename}» больше {MAX_UPLOAD_BYTES // 2**20} МБ")
+            out.append((f.filename or "файл", data))
+        return out
+
+    @app.post("/intake/analyze")
+    def intake_analyze(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+        """Разбор принесённых файлов без сохранения: что это, к чему относится, что уже в базе, что предложить."""
+        from copilot1c.intake import analyze
+
+        if len(files) > 20:
+            raise HTTPException(413, "Не больше 20 файлов за раз")
+        raw = _read_files(files)
+        g, _ = _registry(s)
+        try:
+            res = analyze(raw, g.conn, s)
+            g.conn.rollback()
+            return res
+        finally:
+            g.close()
+
+    @app.post("/intake/accept")
+    def intake_accept(decisions: str = Form("[]"), files: list[UploadFile] = File(...)) -> dict[str, Any]:
+        """Файлы с решениями аналитика → реестр материалов: в очередь обработки или «без индексации»."""
+        from copilot1c.intake import accept
+
+        try:
+            items = json.loads(decisions or "[]")
+            assert isinstance(items, list)
+        except (ValueError, AssertionError) as exc:
+            raise HTTPException(422, "decisions — JSON-список решений по файлам") from exc
+        raw = _read_files(files)
+        g, _ = _registry(s)
+        try:
+            return accept(raw, items, g.conn, s, base=Path.cwd())
+        finally:
+            g.close()
+
+    @app.get("/documents")
+    def documents_list(q: str | None = None, limit: int = 200) -> dict[str, Any]:
+        from copilot1c.documents import KINDS, DocumentRegistry
+
+        g, _ = _registry(s)
+        try:
+            rows = DocumentRegistry(g.conn, s.project).list(q or None, min(max(limit, 1), 1000))
+            g.conn.commit()
+            return {"documents": [_thread_out(r) for r in rows], "kinds": KINDS}
+        finally:
+            g.close()
+
+    @app.get("/documents/{doc_id}")
+    def documents_get(doc_id: int) -> dict[str, Any]:
+        from copilot1c.documents import DocumentRegistry
+
+        g, _ = _registry(s)
+        try:
+            d = DocumentRegistry(g.conn, s.project).get(doc_id)
+            g.conn.commit()
+        finally:
+            g.close()
+        if d is None:
+            raise HTTPException(404, "Документ не найден")
+        return {**_thread_out({k: v for k, v in d.items() if k != "versions"}),
+                "versions": [_thread_out(v) for v in d["versions"]]}
 
     # ---------- письма и ветки ----------
 
