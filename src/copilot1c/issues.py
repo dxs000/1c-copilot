@@ -245,7 +245,7 @@ class IssueRegistry:
             "FROM issue_attachments WHERE issue_id = %s ORDER BY id", (issue_id,))]
         out["events"] = [_out(e) for e in self._all(
             "SELECT id, at, actor, type, field, old_value, new_value, comment FROM issue_events "
-            "WHERE issue_id = %s ORDER BY id", (issue_id,))]
+            "WHERE issue_id = %s ORDER BY at, id", (issue_id,))]  # письма — по времени отправки, не загрузки
         self.conn.commit()
         return out
 
@@ -348,6 +348,33 @@ class IssueRegistry:
             self._event(cur, issue_id, actor, "comment", comment=text.strip())
         self.conn.commit()
         return self.get(issue_id)
+
+    def add_letter_events(self, issue_id: int, letters: list[dict[str, Any]]) -> int:
+        """Каждое письмо переписки — отдельным пунктом истории (тип letter) со временем отправки письма.
+        letters — строки таблицы letters (+ role). Повторно то же письмо не добавляется (по letter_id)."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT new_value->>'letter_id' FROM issue_events WHERE issue_id = %s AND type = 'letter'",
+                        (issue_id,))
+            have = {r[0] for r in cur.fetchall()}
+            added = 0
+            for x in letters:
+                if str(x["id"]) in have:
+                    continue
+                body = text_safe((x.get("body") or "").strip())
+                if x.get("inline_notes"):
+                    body += "\n\n" + text_safe(x["inline_notes"])
+                cur.execute("INSERT INTO issue_events (issue_id, at, actor, type, new_value, comment) "
+                            "VALUES (%s, coalesce(%s, now()), %s, 'letter', %s, %s)",
+                            (issue_id, x.get("sent_at"), text_safe(x.get("sender") or "?"),
+                             Jsonb({"letter_id": str(x["id"]), "email": x.get("sender_email") or None,
+                                    "role": x.get("role"), "subject": text_safe(x.get("subject") or ""),
+                                    "thread_id": x.get("thread_id"), "origin": x.get("origin")}),
+                             body[:20000]))
+                added += 1
+            if added:
+                cur.execute("UPDATE issues SET updated_at = now() WHERE id = %s", (issue_id,))
+        self.conn.commit()
+        return added
 
     def add_attachment(self, issue_id: int, filename: str, data: bytes,
                        actor: str | None = None) -> tuple[dict[str, Any], bool] | None:

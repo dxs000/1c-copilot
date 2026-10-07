@@ -99,9 +99,14 @@ def dedent_quoted(text: str) -> str:
     return "\n".join(lines)
 
 
+_HEADER_LEFTOVER = re.compile(r"^[ \t>]*(?:Importance|Важность|Priority|Приоритет)\s*:\s*\w+[ \t]*\n?",
+                              re.IGNORECASE | re.MULTILINE)
+
+
 def clean_email_text(text: str, mask: bool = True) -> str:
     """Очистка текста одного письма (без цитат — их отделяет thread.split_thread)."""
     text = normalize_whitespace(text)
+    text = _HEADER_LEFTOVER.sub("", text)  # «Importance: High» из заголовка цитаты Outlook
     text = unwrap_safelinks(text)
     text = strip_banners(text)
     text = strip_signature(text)

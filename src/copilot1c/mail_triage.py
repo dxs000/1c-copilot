@@ -78,12 +78,55 @@ def link_email(conn, settings, issue_id: int, name: str, data: bytes, index=None
     with conn.cursor() as cur:
         if tids:
             cur.execute("UPDATE threads SET issue_id = %s WHERE id = ANY(%s) AND issue_id IS NULL", (issue_id, tids))
+            # ветки, которые принадлежат этому обращению (у другой ветки уже своё обращение — её письма не берём)
+            cur.execute("SELECT id FROM threads WHERE id = ANY(%s) AND issue_id = %s", (tids, issue_id))
+            own = [r[0] for r in cur.fetchall()]
+        else:
+            own = []
         refs = external_refs(*[s for p in parsed for s in _subjects(p)])
         if refs:
             cur.execute("""UPDATE issues SET external_refs = (SELECT array(SELECT DISTINCT x FROM
                                unnest(external_refs || %s::text[]) x ORDER BY x)) WHERE id = %s""", (refs, issue_id))
     conn.commit()
-    return {"threads": tids, "refs": refs, "letters_new": sum(len(r.new_letters) for r in results)}
+    events = letter_events(conn, settings, issue_id, own)
+    return {"threads": tids, "refs": refs, "letters_new": sum(len(r.new_letters) for r in results),
+            "history_letters": events}
+
+
+_NOTIFY = re.compile(r"техподдержк|support|helpdesk|service\s*desk|noreply|no-reply|робот|уведомлени", re.IGNORECASE)
+ROLE_LABELS = {"analyst": "аналитик", "internal": "сотрудник", "external": "внешний (исполнитель)",
+               "notification": "уведомление", "unknown": ""}
+
+
+def letter_role(sender: str, email: str, settings) -> str:
+    """Кто писал: аналитик, сотрудник (свой домен), внешний (исполнитель, интегратор), уведомление системы заявок."""
+    from copilot1c.email_intake import ChainMessage, classify
+
+    if _NOTIFY.search(f"{sender or ''} {email or ''}"):
+        return "notification"
+    m = ChainMessage(sender or "", email or "", None, "", "", "file", 0)
+    return classify(m, tuple(settings.internal_domains), tuple(settings.analyst_emails), tuple(settings.analysts))
+
+
+def letter_events(conn, settings, issue_id: int, thread_ids: list[int]) -> int:
+    """Письма веток обращения — в историю обращения, каждое отдельным пунктом (то, чего там ещё нет)."""
+    from psycopg.rows import dict_row
+
+    from copilot1c.issues import IssueRegistry
+
+    if not thread_ids:
+        return 0
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""SELECT id, thread_id, sender, sender_email, sent_at, subject, body, inline_notes, origin
+                       FROM letters WHERE thread_id = ANY(%s) ORDER BY sent_at NULLS FIRST, id""", (thread_ids,))
+        rows = cur.fetchall()
+    # в цитате адреса часто нет — берём адрес того же человека из других писем ветки
+    known = {(r["sender"] or "").casefold(): r["sender_email"] for r in rows if r["sender_email"]}
+    for r in rows:
+        email = r["sender_email"] or known.get((r["sender"] or "").casefold())
+        r["role"] = ROLE_LABELS.get(letter_role(r["sender"], email, settings), "")
+        r["sender_email"] = email
+    return IssueRegistry(conn, settings.project).add_letter_events(issue_id, rows)
 
 
 # ---------- разбор ----------
@@ -153,8 +196,8 @@ UPDATE_SCHEMA: dict[str, Any] = {
         "status": {"type": "string", "enum": ["new", "in_progress", "wait_customer", "wait_developer", "resolved",
                                                "closed"],
                    "description": "Статус обращения после этих писем"},
-        "comment": {"type": "string", "description": "Комментарий в историю обращения: суть обновления, кто что "
-                                                      "сообщил, что дальше; без приветствий и подписей"},
+        "comment": {"type": "string", "description": "Комментарий аналитика в историю: вывод по обновлению и что "
+                                                      "дальше, 1–2 фразы (сами письма уже лягут в историю отдельно)"},
         "resolution": {"type": "string", "description": "Решение, если из писем видно, что проблема решена"},
     },
     "required": ["what_changed", "status", "comment"],
@@ -186,10 +229,9 @@ def _update_proposal(issue: dict[str, Any], new_letters: list, settings, use_llm
                 "resolution": None, "method": "template"}
     last = max(new_letters, key=lambda x: (x.sent_at is not None, x.sent_at))
     body = re.sub(r"\s+", " ", last.body).strip()
-    comment = "\n".join(f"Письмо {x.sender or '?'}" + (f" от {x.sent_at:%d.%m.%Y %H:%M}" if x.sent_at else "")
-                        + ": " + re.sub(r"\s+", " ", x.body).strip()[:400] for x in new_letters[:5])
-    return {"what_changed": f"{last.sender or '?'}: {body[:300]}" + ("…" if len(body) > 300 else ""),
-            "status": issue["status"], "comment": comment, "resolution": None, "method": "template"}
+    # письма сами лягут в историю отдельными пунктами — комментарий только о сути обновления
+    what = f"{last.sender or '?'}: {body[:300]}" + ("…" if len(body) > 300 else "")
+    return {"what_changed": what, "status": issue["status"], "comment": "", "resolution": None, "method": "template"}
 
 
 def triage(files: list[tuple[str, bytes]], question: str, conn, settings, use_llm: bool = True) -> dict[str, Any]:

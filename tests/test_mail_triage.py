@@ -83,7 +83,7 @@ def test_reply_is_update_of_registered_issue(env):
     assert "переписка этой ветки уже связана с обращением" in e["candidates"][0]["why"]
     assert any(w.startswith("номер заявки в теме: 0000026095") for w in e["candidates"][0]["why"])
     assert e["letters"]["letters_new"] == 1 and e["new_letters"][0]["sender"] == "Иванов Петр"
-    assert "исправление установили" in e["update"]["comment"] and e["update"]["method"] == "template"
+    assert "исправление установили" in e["update"]["what_changed"] and e["update"]["method"] == "template"
     assert e["candidates"][0]["version"] >= 1  # для PATCH с защитой от одновременной правки
     block = agent_block(res)
     assert f"Относится к ОБР-{issue['id']:04d}" in block and "новых писем 1" in block
@@ -157,3 +157,31 @@ def test_backfill_links_old_attachments(env, monkeypatch):
     assert e["decision"] == "update" and e["candidates"][0]["id"] == issue["id"]
     assert c.post("/issues/triage", files=[("files", ("re.eml", REPLY, "message/rfc822"))]).json()["emails"][0][
         "decision"] == "update"
+
+
+@pytest.mark.skipif(not PG_DSN, reason="нет COPILOT_TEST_PG_DSN")
+def test_each_letter_is_a_history_item(env):
+    """Каждое письмо переписки — отдельный пункт истории обращения: автор, роль, время отправки."""
+    s, g, c = env
+    s2 = s.model_copy(update={"internal_domains": ("pierre-fabre.com",)})
+    c = TestClient(server.create_app(s2))
+    issue = _register(c)
+    reply = c.post(f"/issues/{issue['id']}/attachments",
+                   files=[("files", ("re.eml", REPLY, "message/rfc822"))]).json()["attachments"][0]
+    assert reply["linked"]["history_letters"] == 1  # первое письмо уже было в истории — добавилось только новое
+    events = c.get(f"/issues/{issue['id']}").json()["events"]
+    letters = [e for e in events if e["type"] == "letter"]
+    assert [(e["actor"], e["new_value"]["role"]) for e in letters] == [("Петрова Анна", "сотрудник"),
+                                                                        ("Иванов Петр", "внешний (исполнитель)")]
+    assert letters[0]["at"].startswith("2026-09-28T09:10") and letters[1]["at"].startswith("2026-10-06T17:40")
+    assert letters[1]["comment"].startswith("Коллеги, исправление установили")
+    assert events.index(letters[0]) < [e["type"] for e in events].index("created")  # история — по времени писем
+    again = c.post(f"/issues/{issue['id']}/attachments",
+                   files=[("files", ("re2.eml", REPLY + b" ", "message/rfc822"))]).json()["attachments"][0]
+    assert again["linked"]["history_letters"] == 0
+
+
+def test_importance_header_leftover_is_removed():
+    from copilot1c.ingest.cleaning import clean_email_text
+
+    assert clean_email_text("Importance: High\n\nДобрый день!\nБланк не грузится.", mask=False).startswith("Добрый день!")
