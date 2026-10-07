@@ -244,3 +244,27 @@ def test_retry_after_error(env):
     item = analyze([("БТ.docx", REQS)], g.conn, s)["items"][0]
     g.conn.rollback()
     assert item["about"].startswith("БТ-1. Билет относится на расходы")
+
+
+def test_intake_decided_by_analyst_words_not_email_text(env, monkeypatch):
+    """Письмо полно жалоб и вопросов («не работает», «ошибка», «?») — тип всё равно «принять в базу»,
+    и модель не вызывается: решают слова аналитика."""
+    from types import SimpleNamespace
+
+    from copilot1c import intent
+
+    s, g, bp = env
+    noisy = Mime()
+    noisy["Subject"], noisy["From"] = "RE: Учет билетов", "SOKOLOV Dmitry <d.sokolov@pierre-fabre.com>"
+    noisy.set_content("Срочно! Не работает загрузка билетов, ошибка при загрузке DBF, не проводится авансовый отчет. "
+                      "Пользователи жалуются, отчет пустой. Почему так? Подготовьте описание TO-BE?")
+    monkeypatch.setattr(intent, "refine_with_llm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM")))
+    monkeypatch.setattr(server, "search_sources", lambda s, q, k=8: [])
+    monkeypatch.setattr(server, "run_question", lambda s, q, attached="", search_query=None, task="":
+                        SimpleNamespace(answer="ok", steps=1, trace=[]))
+    c = TestClient(server.create_app(s.model_copy(update={"yc_api_key": "k", "yc_folder_id": "f",
+                                                          "intent_llm": True})))
+    r = c.post("/ask/files", data={"question": "принять в базу"},
+               files=[("files", ("RE.eml", bytes(noisy), "message/rfc822"))]).json()
+    assert r["intent"]["primary"] == "intake" and r["intake"]["items"][0]["kind"] == "email"
+    assert r["issue_draft"] is None

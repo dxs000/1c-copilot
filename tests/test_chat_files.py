@@ -13,7 +13,7 @@ from copilot1c.config import Settings
 
 
 def _settings(**kw):
-    return Settings(ocr_backend="none", yc_api_key="k", yc_folder_id="f", onec_bin="/nonexistent",
+    return Settings(ocr_backend="none", yc_api_key="k", yc_folder_id="f", onec_bin="/nonexistent", intake_llm=False,
                     intent_llm=False, internal_domains=DOMAINS, analyst_emails=ANALYST_EMAILS, analysts=ANALYSTS, **kw)
 
 

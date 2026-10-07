@@ -202,6 +202,36 @@ def contours_cmd(add: str = typer.Option(None, help="Добавить: «вид:
             typer.echo(f"{c['id']:>4} {c['kind_label']:8} {c['name']}{extra}{'' if c['active'] else ' [выключен]'}")
 
 
+@app.command("link-issue-emails")
+def link_issue_emails(index: bool = typer.Option(True, help="Новые письма — и в базу поиска (нужны ключи AI Studio)")):
+    """Письма, уже приложенные к обращениям, — в ветки переписки; ветки — к обращениям; номера заявок из темы —
+    в обращения. После этого ответы по той же переписке узнаются как обновления (один раз после обновления ядра)."""
+    from pathlib import Path as _P
+
+    from copilot1c.email_intake import is_email_file
+    from copilot1c.mail_triage import link_email
+    from copilot1c.search import PgIndex
+
+    s = get_settings()
+    with _connect() as g:
+        idx = PgIndex(g.conn, s) if index and s.yc_api_key and s.yc_folder_id else None
+        rows = g.query("""SELECT a.issue_id, a.filename, a.path FROM issue_attachments a JOIN issues i ON i.id = a.issue_id
+                          WHERE i.project = %s ORDER BY a.issue_id, a.id""", (s.project,))
+        done = 0
+        for r in rows:
+            if not is_email_file(r["filename"]):
+                continue
+            path = _P(r["path"])
+            if not path.is_file():
+                typer.echo(f"ОБР-{r['issue_id']:04d}: нет файла {r['path']}", err=True)
+                continue
+            res = link_email(g.conn, s, r["issue_id"], r["filename"], path.read_bytes(), index=idx)
+            done += 1
+            typer.echo(f"ОБР-{r['issue_id']:04d} «{r['filename']}»: ветки {res['threads']}, новых писем "
+                       f"{res.get('letters_new', 0)}" + (f", номера заявок {', '.join(res['refs'])}" if res["refs"] else ""))
+    typer.echo(f"Писем обработано: {done}")
+
+
 @app.command("search")
 def search_cmd(query: str, k: int = typer.Option(10), contour: list[int] = typer.Option(None, help="id контура"),
                superseded: bool = typer.Option(False, help="Включать заменённые редакции")):

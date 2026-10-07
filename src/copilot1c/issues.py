@@ -60,10 +60,10 @@ EDITABLE = (
     "infobase", "server", "config_version", "platform_version", "objects",
     "initiator_contact_id", "reported_at", "registered_by", "source", "source_ref", "source_message_id",
     "classifier_confidence", "duplicate_of", "requirement_ids", "test_case_ids",
-    "root_cause", "resolution", "kb_material_id",
+    "root_cause", "resolution", "kb_material_id", "external_refs",
 )
 _CHOICES = {"status": STATUSES, "category": CATEGORIES, "priority": PRIORITIES, "source": SOURCES}
-_ARRAYS = ("tags", "objects", "requirement_ids", "test_case_ids")
+_ARRAYS = ("tags", "objects", "requirement_ids", "test_case_ids", "external_refs")
 _NUMBER = re.compile(r"^\s*(?:ОБР-?)?0*(\d+)\s*$", re.IGNORECASE)
 
 

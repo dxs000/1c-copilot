@@ -266,6 +266,13 @@ CREATE TABLE IF NOT EXISTS issues (
 );
 CREATE INDEX IF NOT EXISTS issues_status_idx ON issues (project, status, id);
 CREATE INDEX IF NOT EXISTS issues_objects_idx ON issues USING gin (objects);
+-- Номера заявок из темы писем (0000026095, INC0012345…): по ним следующее письмо узнаётся как обновление
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'issues' AND column_name = 'external_refs') THEN
+        ALTER TABLE issues ADD COLUMN external_refs text[] NOT NULL DEFAULT '{}';
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS issues_refs_idx ON issues USING gin (external_refs);
 CREATE UNIQUE INDEX IF NOT EXISTS issues_message_idx ON issues (project, source_message_id)
     WHERE source_message_id IS NOT NULL;
 

@@ -46,6 +46,10 @@
         ничего не сохраняет. POST /issues/{id}/attachments с expand=true — письмо прикрепляется вместе
         с файлами, вложенными в него (скриншоты, логи);
   GET   /contacts?q=, POST /contacts — инициаторы обращений (сотрудники заказчика).
+  POST  /issues/triage (multipart files, question) — письмо по обращениям (mail_triage.py): что нового, к какому
+        обращению относится, предложение «обновить ОБР-…» (что изменилось, комментарий, статус) / «новое» / «в базу».
+        Письмо, прикреплённое к обращению, записывается в ветки переписки, ветка связывается с обращением, номера
+        заявок из темы — в external_refs: следующий ответ по той же переписке узнаётся сам.
 """
 
 from __future__ import annotations
@@ -254,6 +258,7 @@ class IssueFields(BaseModel):
     root_cause: str | None = None
     resolution: str | None = None
     kb_material_id: int | None = None
+    external_refs: list[str] | None = None
 
 
 class IssueCreate(IssueFields):
@@ -438,15 +443,41 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 g.close()
         attached = context_block(items)
         emails = [it for it in items if it.kind == "email"]
-        # тип сообщения — по вопросу и тексту писем (проблему обычно описывает письмо, а не вопрос)
-        kind = classify_message(s, "\n\n".join([question, *(e.text[:4000] for e in emails)]), has_files=True)
+        # «принять в базу» решают слова аналитика, а не текст приложенных писем: в переписке полно вопросов,
+        # жалоб и просьб «подготовить», и по общему тексту модель видела «подготовить документ»
+        own = classify_message(s, question, has_files=True, use_llm=False)
+        if own.get("intent", {}).get("primary") in ("intake", "issue_mail") and own["intent"].get("confident"):
+            kind = own
+        else:  # тип по вопросу и тексту писем (проблему обычно описывает письмо, а не вопрос)
+            kind = classify_message(s, "\n\n".join([question, *(e.text[:4000] for e in emails)]), has_files=True)
         email_info = _email_for_issue(s, raw) if kind.get("issue_draft") else None
         if email_info:
             kind["issue_draft"] = {**kind["issue_draft"], **email_info}
         subjects = " ".join(dict.fromkeys(e.subject for e in emails if e.subject))
         search_query = f"{question} {subjects}".strip() if subjects else None
-        intake, task = None, ""
-        if kind.get("intent", {}).get("primary") == "intake":  # «разбери и добавь в базу» — разбор приложенного
+        intake, task, triage_res = None, "", None
+        primary = kind.get("intent", {}).get("primary")
+        if emails and (primary == "issue_mail" or kind.get("issue_draft")):
+            # письмо по обращениям: новое, обновление существующего или только в базу — решает разбор письма
+            from copilot1c.mail_triage import TRIAGE_TASK, agent_block, triage
+
+            g = try_connect(s)
+            if g is not None:
+                try:
+                    triage_res = triage(raw, question, g.conn, s)
+                except Exception:  # noqa: BLE001 — разбор не удался: ответ агента всё равно будет
+                    import logging
+
+                    logging.getLogger("copilot1c.mail_triage").exception("разбор письма по обращениям")
+                    g.conn.rollback()
+                finally:
+                    g.close()
+            if triage_res and triage_res["emails"]:
+                task = f"{TRIAGE_TASK}\n\nРазбор письма:\n{agent_block(triage_res)}"
+                draft = kind.get("issue_draft") or {}
+                if any(e.get("decision") == "update" for e in triage_res["emails"]) and not draft.get("already_registered"):
+                    kind["issue_draft"] = None  # это обновление существующего — «Зарегистрировать» не предлагаем
+        if primary == "intake":  # «разбери и добавь в базу» — разбор приложенного
             from copilot1c.intake import INTAKE_TASK, agent_block, analyze
 
             g = try_connect(s)
@@ -465,7 +496,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
-                "attachments": [it.out() for it in items], "intake": intake,
+                "attachments": [it.out() for it in items], "intake": intake, "triage": triage_res,
                 "web_sources": getattr(result, "web_sources", []),
                 "escalation": getattr(result, "escalation", None), "issues": getattr(result, "issues", [])}
 
@@ -1009,6 +1040,21 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             out["reason"] += " (не задан COPILOT_INTERNAL_DOMAINS — свои домены неизвестны)"
         return out
 
+    @app.post("/issues/triage")
+    def issues_triage(files: list[UploadFile] = File(...), question: str = Form("")) -> dict[str, Any]:
+        """Письма по обращениям: что нового, к какому обращению, что предложить (обновить / новое / в базу).
+        Ничего не сохраняет."""
+        from copilot1c.mail_triage import triage
+
+        raw = _read_files(files)
+        g, _ = _registry(s)
+        try:
+            res = triage(raw, question, g.conn, s)
+            g.conn.rollback()
+            return res
+        finally:
+            g.close()
+
     @app.post("/issues/{issue_id}/attachments")
     def issues_attach(issue_id: int, files: list[UploadFile] = File(...), actor: str | None = Form(None),
                       expand: bool = Form(False)) -> dict[str, Any]:
@@ -1037,6 +1083,16 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
                     out.append({"filename": name, "error": "пустой файл — не сохранён"})
                     continue
                 attach(name, data)
+                if is_email_file(name):  # письмо — в ветки переписки, ветка — к обращению (следующий ответ узнается)
+                    try:
+                        from copilot1c.mail_triage import link_email
+                        from copilot1c.search import PgIndex
+
+                        index = PgIndex(g.conn, s) if s.yc_api_key and s.yc_folder_id else None
+                        out[-1]["linked"] = link_email(g.conn, s, issue_id, name, data, index=index, actor=actor)
+                    except Exception as exc:  # noqa: BLE001 — вложение сохранено, связь с перепиской не вышла
+                        g.conn.rollback()
+                        out[-1]["link_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
                 if expand and is_email_file(name):
                     try:
                         inner = read_chain(name, data)[1]
