@@ -1,7 +1,7 @@
 """Командная строка: copilot1c <команда>.
 
 Команды разбора (parse-*) работают локально без облака — удобно проверять чанкинг на своих файлах.
-Команды index-* и ask требуют настроенного .env (AI Studio, PostgreSQL).
+Команды index-*, search и ask требуют настроенного .env (AI Studio, PostgreSQL с pgvector).
 """
 
 from __future__ import annotations
@@ -90,29 +90,28 @@ def init_db():
     typer.echo("Схема создана")
 
 
-def _vector_store(value: str | None) -> str:
-    """Идентификатор индекса: опция --vector-store, иначе COPILOT_VECTOR_STORE_ID из окружения или .env."""
-    vs = value or get_settings().vector_store_id
-    if not vs:
-        raise typer.BadParameter("Задайте COPILOT_VECTOR_STORE_ID в .env или передайте --vector-store "
-                                 "(создать индекс: copilot1c create-index <имя>)")
-    return vs
+PG_HINT = ("PostgreSQL недоступен ({dsn}) — база поиска, граф и реестры живут в нём. Локально: docker run -d "
+           "--name copilot-pg -p 5432:5432 -e POSTGRES_USER=copilot -e POSTGRES_PASSWORD=copilot -e POSTGRES_DB=copilot "
+           "pgvector/pgvector:pg16, затем copilot1c init-db и повторный index-docs.")
 
 
-PG_HINT = ("PostgreSQL недоступен ({dsn}) — граф и реестры (тест-кейсы, план тестирования, покрытие) не записаны; "
-           "поиск по Vector Store работает. Локально: docker run -d --name copilot-pg -p 5432:5432 "
-           "-e POSTGRES_USER=copilot -e POSTGRES_PASSWORD=copilot -e POSTGRES_DB=copilot pgvector/pgvector:pg16, "
-           "затем copilot1c init-db и повторный index-docs (уже загруженные чанки не загружаются заново).")
+def _connect():
+    from copilot1c.graph.store import try_connect
+
+    s = get_settings()
+    g = try_connect(s)
+    if g is None:
+        typer.echo(PG_HINT.format(dsn=s.pg_dsn.split("@")[-1]), err=True)
+        raise typer.Exit(1)
+    return g
 
 
 @app.command("index-docs")
-def index_docs(paths: list[Path], vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
-               graph: bool = typer.Option(True, help="Записывать граф и реестры в PostgreSQL, если он доступен"),
+def index_docs(paths: list[Path],
                llm_entities: bool = typer.Option(False, help="Дополнительно извлекать сущности LLM")):
-    """Проиндексировать почту и документы: Vector Store + (если доступен) граф и реестры в PostgreSQL."""
-    from copilot1c.graph.store import try_connect
-    from copilot1c.index.yandex import VectorIndex
+    """Проиндексировать почту и документы в базу поиска PostgreSQL (эмбеддинги AI Studio), граф и реестры."""
     from copilot1c.ingest.entities import extract_regex_entities
+    from copilot1c.search import PgIndex
 
     s = get_settings()
     corpus = _corpus(paths)
@@ -120,26 +119,14 @@ def index_docs(paths: list[Path], vector_store: str | None = typer.Option(None, 
     chunks = corpus.chunks()
     typer.echo(f"Чанков: {len(chunks)}")
 
-    index = VectorIndex(_vector_store(vector_store))
-    if not index.load_manifest():
-        try:  # индекс мог быть заполнен прошлым запуском, упавшим до записи манифеста
-            index.rebuild_manifest(typer.echo)
-        except Exception as exc:  # noqa: BLE001 — список файлов индекса не критичен
-            typer.echo(f"Не удалось прочитать содержимое индекса ({type(exc).__name__}); если индекс не пустой, "
-                       "возможны дубли — надёжнее создать новый: copilot1c create-index <имя>", err=True)
-    ids = index.add(chunks, progress=typer.echo)
-    typer.echo(f"Vector Store: в индексе {len(ids)} чанков этого корпуса")
-
-    g = try_connect(s) if graph else None
-    if g is None:
-        if graph:
-            typer.echo(PG_HINT.format(dsn=s.pg_dsn.split("@")[-1]), err=True)
-        return
-    with g:
-        g.upsert_chunks(chunks, ids)
+    with _connect() as g:
+        new = set(PgIndex(g.conn, s).add(chunks, progress=typer.echo))
+        typer.echo(f"База поиска: новых фрагментов {len(new)}, всего фрагментов этого корпуса {len(chunks)}")
         for d in corpus.documents:
             g.upsert_registries(s.project, d)
         for c in chunks:
+            if c.chunk_id not in new:
+                continue
             g.upsert_entities(extract_regex_entities(c.entity_text()), c.chunk_id)
             if llm_entities:
                 from copilot1c.ingest.entities_llm import extract_llm_entities
@@ -150,28 +137,83 @@ def index_docs(paths: list[Path], vector_store: str | None = typer.Option(None, 
     typer.echo("Граф и реестры записаны в PostgreSQL")
 
 
-@app.command("create-index")
-def create_index(name: str):
-    """Создать Vector Store в AI Studio и вывести его id."""
-    from copilot1c.index.yandex import VectorIndex
+KNOWLEDGE_TABLES = ("mentions", "relations", "entities", "requirement_tests", "requirements", "test_cases", "chunks",
+                    "bsl_calls", "bsl_methods", "md_objects")
 
-    typer.echo(VectorIndex.create(name).id)
+
+@app.command("reset-knowledge")
+def reset_knowledge(yes: bool = typer.Option(False, "--yes", help="Подтверждение: без него ничего не удаляется"),
+                    materials: bool = typer.Option(True, help="Убрать и реестр загрузок (файлы на диске остаются)")):
+    """Очистить базу знаний: фрагменты, граф, реестры (и реестр загрузок). Обращения и контакты не трогаются."""
+    if not yes:
+        typer.echo("Удалит все фрагменты, граф, реестры тест-кейсов и требований"
+                   + (" и реестр загруженных материалов" if materials else "")
+                   + ". Обращения, контакты и контуры останутся. Повторите с --yes.")
+        raise typer.Exit(1)
+    with _connect() as g:
+        g.init_schema()
+        for t in KNOWLEDGE_TABLES:
+            g.conn.execute(f"DELETE FROM {t}")
+        if materials:  # обращения ссылаются на материалы (kb_material_id) — ссылки обнулятся
+            g.conn.execute("DELETE FROM materials")
+    typer.echo("База знаний очищена")
+
+
+@app.command("contours")
+def contours_cmd(add: str = typer.Option(None, help="Добавить: «вид:название», вид — system, process или project"),
+                 parent: int = typer.Option(None, help="id родительского контура для --add"),
+                 aliases: str = typer.Option("", help="Псевдонимы через запятую для --add"),
+                 notes: str = typer.Option(None, help="Пояснения для агента для --add")):
+    """Справочник контуров: показать или добавить."""
+    from copilot1c.contours import ContourError, ContourRegistry
+
+    s = get_settings()
+    with _connect() as g:
+        reg = ContourRegistry(g.conn, s.project)
+        if add:
+            kind, _, name = add.partition(":")
+            try:
+                c = reg.create({"kind": kind.strip(), "name": name, "parent_id": parent,
+                                "aliases": [a for a in aliases.split(",") if a.strip()], "notes": notes})
+            except ContourError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            typer.echo(f"Добавлен: {c['id']} {c['kind_label']} «{c['name']}»")
+            return
+        for c in reg.list(include_inactive=True):
+            extra = (f" ← {c['parent_id']}" if c["parent_id"] else "") + (f" ({', '.join(c['aliases'])})"
+                                                                           if c["aliases"] else "")
+            typer.echo(f"{c['id']:>4} {c['kind_label']:8} {c['name']}{extra}{'' if c['active'] else ' [выключен]'}")
+
+
+@app.command("search")
+def search_cmd(query: str, k: int = typer.Option(10), contour: list[int] = typer.Option(None, help="id контура"),
+               superseded: bool = typer.Option(False, help="Включать заменённые редакции")):
+    """Поиск по базе так, как его видит агент: место в векторном и лексическом списках, итог слияния."""
+    from copilot1c.retrieval import smart_search, source_label
+    from copilot1c.search import PgIndex
+
+    s = get_settings()
+    with _connect() as g:
+        index = PgIndex(g.conn, s)
+        statuses = ("active", "superseded") if superseded else ("active",)
+        hits = smart_search(lambda q, f, kk: index.search(q, filters=f, k=kk, contours=contour or None,
+                                                          statuses=statuses), query, {"project": s.project}, k)
+    for i, h in enumerate(hits, 1):
+        r = h.get("ranks", {})
+        typer.echo(f"{i:>2}. {h['score']:.4f} [вектор {r.get('vector') or '–'} / слова {r.get('lexical') or '–'}] "
+                   f"{source_label(h['attributes'], h['text'])}")
 
 
 @app.command("ask")
-def ask(question: str, vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
-        dumps_root: Path = typer.Option(Path("data/dumps")),
+def ask(question: str, dumps_root: Path = typer.Option(Path("data/dumps")),
         trace: bool = typer.Option(False, help="Показать вызовы инструментов агентом")):
-    """Задать вопрос агенту. Без PostgreSQL работает только поиск по документам и коду."""
+    """Задать вопрос агенту (нужен PostgreSQL: база поиска, граф, реестры, обращения)."""
     from copilot1c.agent.tools import ToolContext, run_agent
-    from copilot1c.graph.store import try_connect
 
     s = get_settings()
-    g = try_connect(s)
-    if g is None:
-        typer.echo("PostgreSQL недоступен: граф и SQL-реестры отключены, отвечаю по поиску в Vector Store.", err=True)
+    g = _connect()
     try:
-        result = run_agent(question, ToolContext(s, _vector_store(vector_store), dumps_root, g))
+        result = run_agent(question, ToolContext(s, dumps_root, g))
         typer.echo(result.answer)
         if trace:
             typer.echo(f"\n— шагов модели: {result.steps}", err=True)
@@ -179,8 +221,7 @@ def ask(question: str, vector_store: str | None = typer.Option(None, help="По 
                 status = "повтор" if t.get("repeat") else t.get("error") or f"{t.get('result_chars', 0)} симв."
                 typer.echo(f"  {t['tool']}({t['args']}) → {status}", err=True)
     finally:
-        if g is not None:
-            g.close()
+        g.close()
 
 
 @app.command("serve")
@@ -237,31 +278,25 @@ def web_search_cmd(query: str, sites: list[str] = typer.Option(None, "--site", h
 def eval_cmd(golden: Path = typer.Argument(..., help="JSON с эталонными вопросами (см. tests/eval/example.json)"),
              answers: bool = typer.Option(False, help="Проверять и ответы агента (дольше и дороже)"),
              k: int = typer.Option(10, help="Сколько чанков смотреть в поиске"),
-             vector_store: str | None = typer.Option(None, help="По умолчанию из .env"),
              dumps_root: Path = typer.Option(Path("data/dumps"))):
     """Оценка качества: recall@k поиска и наличие обязательных фактов в ответах агента."""
     from copilot1c import eval as ev
-    from copilot1c.index.yandex import VectorIndex
+    from copilot1c.retrieval import smart_search
+    from copilot1c.search import PgIndex, search_fn
 
     s = get_settings()
-    vs_id = _vector_store(vector_store)
-    index = VectorIndex(vs_id, s)
     cases = ev.load_cases(golden)
-
-    from copilot1c.retrieval import smart_search
+    store = _connect()
+    raw = search_fn(PgIndex(store.conn, s))
 
     def search(question: str, filters: dict, top_k: int) -> list[dict]:
-        raw = lambda q, f, kk: index.search(q, filters=f, k=kk)  # noqa: E731
         return smart_search(raw, question, {"project": s.project, **filters}, top_k)
 
     answer = None
-    store = None
     if answers:
         from copilot1c.agent.tools import ToolContext, run_agent
-        from copilot1c.graph.store import try_connect
 
-        store = try_connect(s)
-        ctx = ToolContext(s, vs_id, dumps_root, store)
+        ctx = ToolContext(s, dumps_root, store)
 
         def answer(question: str):
             return run_agent(question, ctx)
@@ -270,8 +305,7 @@ def eval_cmd(golden: Path = typer.Argument(..., help="JSON с эталонным
     try:
         results = ev.run(cases, search, answer, k=k, progress=typer.echo)
     finally:
-        if store is not None:
-            store.close()
+        store.close()
     typer.echo(ev.report_text(results, k))
     typer.echo(f"Подробно: {ev.save(results, k, Path(s.cache_dir or '.cache') / 'eval')}")
 

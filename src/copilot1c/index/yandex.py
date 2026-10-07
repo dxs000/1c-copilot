@@ -1,21 +1,20 @@
 """Клиент Yandex AI Studio через OpenAI-совместимый API.
 
-Чат, эмбеддинги, Files и Vector Stores идут через один клиент openai с base_url AI Studio
-и project = идентификатор каталога. Имена моделей задаются в config.Settings.
+Чат и эмбеддинги идут через один клиент openai с base_url AI Studio и project = идентификатор каталога.
+Имена моделей задаются в config.Settings. Поиск по базе проекта — в PostgreSQL (search.py), Vector Store
+AI Studio больше не используется: там один фрагмент — один файл при лимите 10 000 файлов на индекс.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Sequence
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
 
 from copilot1c.config import Settings, get_settings
-from copilot1c.models import Chunk
 
 
 @lru_cache
@@ -99,92 +98,3 @@ def _drop_nulls(value: Any) -> Any:
     if isinstance(value, list):
         return [_drop_nulls(v) for v in value]
     return value
-
-
-class VectorIndex:
-    """Индекс в AI Studio Vector Store: загрузка чанков как файлов с атрибутами для фильтров."""
-
-    def __init__(self, vector_store_id: str, settings: Settings | None = None):
-        self.id = vector_store_id
-        self.s = settings or get_settings()
-
-    @classmethod
-    def create(cls, name: str, settings: Settings | None = None) -> VectorIndex:
-        s = settings or get_settings()
-        vs = client(s).vector_stores.create(name=name)
-        return cls(vs.id, s)
-
-    # --- загрузка с манифестом: повторный запуск не загружает те же чанки второй раз ---
-
-    @property
-    def manifest_path(self) -> Path:
-        return Path(self.s.cache_dir or ".cache") / "vector_store" / f"{self.id}.json"
-
-    def load_manifest(self) -> dict[str, str]:
-        """chunk_id → file_id уже загруженных чанков."""
-        if self.manifest_path.exists():
-            return json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        return {}
-
-    def _save_manifest(self, manifest: dict[str, str]) -> None:
-        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.manifest_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=0), encoding="utf-8")
-        tmp.replace(self.manifest_path)
-
-    def rebuild_manifest(self, progress: Callable[[str], None] = print) -> dict[str, str]:
-        """Восстанавливает манифест по файлам, уже лежащим в индексе (имя файла = chunk_id.md).
-
-        Нужен, если чанки загружались без манифеста (например, запуск упал после загрузки)."""
-        c = client(self.s)
-        manifest: dict[str, str] = {}
-        for vf in c.vector_stores.files.list(vector_store_id=self.id, limit=100):
-            attrs = getattr(vf, "attributes", None) or {}
-            chunk_id = attrs.get("chunk_id")
-            if not chunk_id:
-                name = c.files.retrieve(vf.id).filename or ""
-                chunk_id = name.removesuffix(".md")
-            if chunk_id:
-                manifest[chunk_id] = vf.id
-        self._save_manifest(manifest)
-        progress(f"В индексе уже есть чанков: {len(manifest)}")
-        return manifest
-
-    def add(self, chunks: Iterable[Chunk], progress: Callable[[str], None] | None = None,
-            every: int = 25) -> dict[str, str]:
-        """Загружает чанки, которых ещё нет в индексе. Возвращает chunk_id → file_id для всех чанков."""
-        c = client(self.s)
-        manifest = self.load_manifest()
-        chunks = list(chunks)
-        todo = [ch for ch in chunks if ch.chunk_id not in manifest]
-        if progress and len(todo) < len(chunks):
-            progress(f"Уже в индексе: {len(chunks) - len(todo)}, загружаю новых: {len(todo)}")
-        for i, ch in enumerate(todo, 1):
-            f = c.files.create(file=(f"{ch.chunk_id}.md", ch.text.encode("utf-8")), purpose="assistants")
-            c.vector_stores.files.create(vector_store_id=self.id, file_id=f.id,
-                                         attributes={**ch.attributes(), "chunk_id": ch.chunk_id})
-            manifest[ch.chunk_id] = f.id
-            if i % every == 0 or i == len(todo):
-                self._save_manifest(manifest)  # после сбоя загрузка продолжится с этого места
-                if progress:
-                    progress(f"  загружено {i}/{len(todo)}")
-        return {ch.chunk_id: manifest[ch.chunk_id] for ch in chunks}
-
-    def search(self, query: str, *, filters: dict[str, str] | None = None, k: int = 10) -> list[dict[str, Any]]:
-        flt = None
-        if filters:
-            parts = [{"type": "eq", "key": key, "value": val} for key, val in filters.items()]
-            flt = parts[0] if len(parts) == 1 else {"type": "and", "filters": parts}
-        kwargs: dict[str, Any] = {"query": query, "max_num_results": k}
-        if flt:
-            kwargs["filters"] = flt
-        res = client(self.s).vector_stores.search(self.id, **kwargs)
-        return [
-            {
-                "score": r.score,
-                "file_id": r.file_id,
-                "attributes": r.attributes,
-                "text": "\n".join(part.text for part in r.content),
-            }
-            for r in res.data
-        ]

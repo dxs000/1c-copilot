@@ -21,7 +21,7 @@ class DocType(StrEnum):
 
 
 class Chunk(BaseModel):
-    """Единица индекса. Текст + метаданные для фильтров Vector Store и ссылок на источник."""
+    """Единица базы поиска. Текст + метаданные для фильтров и ссылок на источник."""
 
     text: str
     doc_type: DocType
@@ -46,7 +46,7 @@ class Chunk(BaseModel):
         return h[:16]
 
     def attributes(self) -> dict[str, str]:
-        """Плоские атрибуты для фильтров поиска (Vector Store принимает строки)."""
+        """Плоские строковые атрибуты для фильтров поиска (chunks.attrs) и ссылок на источник."""
         attrs = {
             "title": self.title[:200],
             "doc_type": self.doc_type.value,

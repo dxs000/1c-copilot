@@ -1,11 +1,10 @@
--- Граф знаний и реестры «1С Project Copilot» (Managed PostgreSQL + pgvector)
--- pgvector есть в Managed PostgreSQL Yandex Cloud; локально без него схема тоже создаётся
-DO $$ BEGIN
-    CREATE EXTENSION IF NOT EXISTS vector;
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'pgvector недоступен: колонка chunks.embedding не создаётся';
-END $$;
+-- Граф знаний, реестры и база поиска «1С Project Copilot» (PostgreSQL + pgvector)
+-- Поиск идёт в PostgreSQL (search.py): без pgvector ядро не работает.
+CREATE EXTENSION IF NOT EXISTS vector;
 
+-- Фрагменты базы проекта: единица поиска. status: active — в поиске; superseded — заменён новой редакцией
+-- (в поиск по умолчанию не попадает). contours — контуры (система / процесс / проект), к которым относится
+-- фрагмент; material_id — загрузка, из которой фрагмент пришёл (NULL — проиндексирован командой index-docs).
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id     text PRIMARY KEY,
     project      text NOT NULL,
@@ -18,14 +17,33 @@ CREATE TABLE IF NOT EXISTS chunks (
     objects      text[] NOT NULL DEFAULT '{}',
     attrs        jsonb  NOT NULL DEFAULT '{}',
     text         text   NOT NULL,
-    vs_file_id   text              -- id файла в AI Studio Vector Store
+    embedding    vector,                         -- без размерности: модель эмбеддингов можно сменить
+    status       text NOT NULL DEFAULT 'active',
+    contours     bigint[] NOT NULL DEFAULT '{}',
+    material_id  bigint,
+    indexed_at   timestamptz NOT NULL DEFAULT now(),
+    tsv          tsvector GENERATED ALWAYS AS (to_tsvector('russian', coalesce(title, '') || ' ' || text)) STORED
 );
+-- Переход с Vector Store (07.10.2026) для таблицы прежней схемы. Выполняется один раз: ALTER берёт
+-- исключительную блокировку и при каждом init-db ждал бы открытых транзакций демона.
 DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
-        -- резервный локальный поиск; размерность сверить с моделью эмбеддингов
-        ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding vector(256);
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'chunks' AND column_name = 'tsv') THEN
+        ALTER TABLE chunks DROP COLUMN IF EXISTS vs_file_id;
+        ALTER TABLE chunks DROP COLUMN IF EXISTS embedding;  -- прежний резервный vector(256) не заполнялся
+        ALTER TABLE chunks ADD COLUMN embedding vector;
+        ALTER TABLE chunks ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';
+        ALTER TABLE chunks ADD COLUMN IF NOT EXISTS contours bigint[] NOT NULL DEFAULT '{}';
+        ALTER TABLE chunks ADD COLUMN IF NOT EXISTS material_id bigint;
+        ALTER TABLE chunks ADD COLUMN IF NOT EXISTS indexed_at timestamptz NOT NULL DEFAULT now();
+        ALTER TABLE chunks ADD COLUMN tsv tsvector
+            GENERATED ALWAYS AS (to_tsvector('russian', coalesce(title, '') || ' ' || text)) STORED;
     END IF;
 END $$;
+CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING gin (tsv);
+CREATE INDEX IF NOT EXISTS chunks_attrs_idx ON chunks USING gin (attrs jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS chunks_contours_idx ON chunks USING gin (contours);
+CREATE INDEX IF NOT EXISTS chunks_material_idx ON chunks (material_id);
+CREATE INDEX IF NOT EXISTS chunks_status_idx ON chunks (project, status);
 CREATE INDEX IF NOT EXISTS chunks_objects_idx ON chunks USING gin (objects);
 CREATE INDEX IF NOT EXISTS chunks_type_idx ON chunks (project, doc_type);
 
@@ -153,6 +171,22 @@ CREATE TABLE IF NOT EXISTS materials (
 );
 CREATE INDEX IF NOT EXISTS materials_status_idx ON materials (status, id);
 
+-- Контуры: к чему относится материал — система (УТ 11, БП 3.0…), процесс или тема (командировки, НСИ…),
+-- проект (обновление УТ 11 до 11.5.27.75). Справочник ведут аналитики; notes — предметные пояснения для
+-- промпта агента (префиксы доработок, версии, особенности), aliases — как контур называют в письмах.
+CREATE TABLE IF NOT EXISTS contours (
+    id          bigserial PRIMARY KEY,
+    project     text NOT NULL,
+    kind        text NOT NULL CHECK (kind IN ('system', 'process', 'project')),
+    name        text NOT NULL,
+    parent_id   bigint REFERENCES contours(id) ON DELETE SET NULL,
+    aliases     text[] NOT NULL DEFAULT '{}',
+    notes       text,
+    active      boolean NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (project, kind, name)
+);
+
 -- ===== Обращения (проблемы, о которых сообщают аналитики интегратора) =====
 -- Заводят обращения только аналитики интегратора (через веб или чат). Пользователи заказчика с системой
 -- не работают: они — инициаторы проблем и хранятся в contacts (обычно извлекаются из приложенного письма).
@@ -222,7 +256,7 @@ CREATE INDEX IF NOT EXISTS issues_objects_idx ON issues USING gin (objects);
 CREATE UNIQUE INDEX IF NOT EXISTS issues_message_idx ON issues (project, source_message_id)
     WHERE source_message_id IS NOT NULL;
 
--- Вложения обращений: скриншоты, логи, письма. В индекс (Vector Store) не попадают.
+-- Вложения обращений: скриншоты, логи, письма. В базу поиска не попадают.
 CREATE TABLE IF NOT EXISTS issue_attachments (
     id              bigserial PRIMARY KEY,
     issue_id        bigint NOT NULL REFERENCES issues(id) ON DELETE CASCADE,

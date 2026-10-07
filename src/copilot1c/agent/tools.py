@@ -16,7 +16,7 @@ from typing import Any
 from copilot1c.code1c.platform import Designer
 from copilot1c.config import Settings, get_settings
 from copilot1c.graph.store import GraphStore
-from copilot1c.index.yandex import VectorIndex, client
+from copilot1c.index.yandex import client
 from copilot1c.retrieval import format_hits, smart_search
 
 SYSTEM_PROMPT = """Ты — 1С Project Copilot, аналитик проекта внедрения 1С. Отвечай по-русски, коротко и по делу.
@@ -109,9 +109,9 @@ TOOLS = [
 @dataclass
 class ToolContext:
     settings: Settings
-    vector_store_id: str
     dumps_root: Path  # Git-репозиторий выгрузок: <dumps_root>/<config>/...
-    store: GraphStore | None = None
+    store: GraphStore | None = None  # PostgreSQL: база поиска, граф, реестры, обращения
+    contours: list[int] | None = None  # область поиска (контуры); None — вся база
     web_sources: list[dict] = field(default_factory=list)  # что агент нашёл и прочитал в интернете
     web_searches: int = 0
     web_pages: int = 0
@@ -120,8 +120,11 @@ class ToolContext:
 
 
 def _raw_search(ctx: ToolContext) -> Callable[[str, dict, int], list[dict]]:
-    index = VectorIndex(ctx.vector_store_id, ctx.settings)
-    return lambda q, f, k: index.search(q, filters=f, k=k)
+    from copilot1c.search import PgIndex, search_fn
+
+    if ctx.store is None:
+        raise RuntimeError("PostgreSQL недоступен — поиск по базе проекта невозможен")
+    return search_fn(PgIndex(ctx.store.conn, ctx.settings), ctx.contours)
 
 
 def _search(ctx: ToolContext, query: str, filters: dict[str, str], k: int) -> list[dict]:

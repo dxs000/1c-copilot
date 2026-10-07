@@ -5,7 +5,7 @@
 раз не сохраняется: возвращается уже существующая запись.
 
 Статусы по жизненному циклу: queued → parsing → indexing → graph → done; duplicate — всё содержимое
-уже было в базе; error — с причиной в detail.
+уже было в базе; error — с причиной в detail; deleted — фрагменты убраны из базы, файл и запись остаются.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ STATUS_LABELS = {
     "done": "готово",
     "duplicate": "уже есть",
     "error": "ошибка",
+    "deleted": "удалён",
 }
 ACTIVE = ("queued", "parsing", "indexing", "graph")
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # как предел разбора одного файла в ingest.attachments
@@ -104,7 +105,8 @@ class MaterialRegistry:
     def set_status(self, material_id: int, status: str, detail: str | None = None,
                    report: dict[str, Any] | None = None) -> None:
         stamps = {"parsing": ", started_at = now()", "done": ", finished_at = now()",
-                  "duplicate": ", finished_at = now()", "error": ", finished_at = now()"}.get(status, "")
+                  "duplicate": ", finished_at = now()", "error": ", finished_at = now()",
+                  "deleted": ", finished_at = now()"}.get(status, "")
         with self.conn.cursor() as cur:
             cur.execute(f"UPDATE materials SET status = %s, detail = %s, report = coalesce(%s, report){stamps} "
                         "WHERE id = %s", (status, detail, Jsonb(report) if report is not None else None, material_id))
@@ -116,6 +118,9 @@ def register_upload(registry: MaterialRegistry, root: Path, filename: str, data:
     """Сохраняет файл и добавляет в реестр. Возвращает (запись, загружен_раньше)."""
     sha = hashlib.sha256(data).hexdigest()
     existing = registry.find_sha(sha)
+    if existing is not None and existing["status"] == "deleted":  # удалённый из базы загружают снова — в очередь
+        registry.set_status(existing["id"], "queued", "загружен повторно после удаления")
+        return registry.get(existing["id"]), False
     if existing is not None:
         return existing, True
     path = save_upload(root, filename, data)

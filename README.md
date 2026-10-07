@@ -50,7 +50,9 @@ RAG-системы для 1С на Yandex Cloud AI».
 | `ingest/ocr.py` | Yandex Vision OCR / tesseract |
 | `ingest/entities.py`, `ingest/entities_llm.py` | Сущности: версии, серверы, документы, объекты 1С и доработки КС; LLM-извлечение |
 | `code1c/*` | Команды платформы 1С, разбор BSL на методы, карточки объектов метаданных |
-| `index/yandex.py` | AI Studio через OpenAI-совместимый API: эмбеддинги, structured output, Vector Store |
+| `index/yandex.py` | AI Studio через OpenAI-совместимый API: чат, эмбеддинги, structured output |
+| `search.py` | База поиска в PostgreSQL: фрагменты с эмбеддингами, гибридный поиск (pgvector + полнотекстовый russian, слияние RRF), статусы, удаление материала |
+| `contours.py` | Справочник контуров: система, процесс или тема, проект |
 | `graph/*` | Граф сущностей и реестры в PostgreSQL |
 | `agent/tools.py` | Инструменты агента и цикл function calling |
 | `agent/issues_tools.py` | Обращения для агента: по номеру, поиск, возможные дубли до вызова модели |
@@ -79,11 +81,27 @@ uv run copilot1c parse-code path/to/dump --config "УТ 11.5.27.75"
 С облаком: скопируйте `.env.example` в `.env`, заполните каталог и API-ключ AI Studio, затем
 
 ```bash
-uv run copilot1c init-db
-uv run copilot1c create-index ut11-update   # выведет id — впишите его в .env как COPILOT_VECTOR_STORE_ID
+uv run copilot1c init-db                    # схема; нужен PostgreSQL с pgvector
 uv run copilot1c index-docs data/mails data/docs --llm-entities
+uv run copilot1c search "с какой версии обновляется УТ"   # что найдёт поиск: место в векторном и лексическом списках
 uv run copilot1c ask "Почему обновляемся на 11.5.27.75, а не на 11.6?"
 ```
+
+### Поиск
+
+База поиска — таблица `chunks` в PostgreSQL (`search.py`). Эмбеддинги считает AI Studio (модель документов
+при записи, модель запросов при поиске), ищет PostgreSQL: векторная близость (pgvector, точный перебор) и
+полнотекстовый поиск с русской морфологией, списки сливаются по RRF. Номера версий («11.5.19.55») словарь
+хранит целиком — они находятся точно. Фрагмент несёт статус (`active` / `superseded` — заменён новой
+редакцией, в поиск по умолчанию не попадает), контуры и материал, из которого пришёл.
+
+AI Studio Vector Store больше не используется: там один фрагмент — один файл при лимите 10 000 файлов на
+индекс, удаление и редакции пришлось бы синхронизировать отдельно.
+
+- `copilot1c contours` — справочник контуров; `--add system:"УТ 11" --aliases "УТ11,Управление торговлей"`.
+- `copilot1c reset-knowledge --yes` — очистить фрагменты, граф, реестры и реестр загрузок (обращения,
+  контакты и контуры остаются).
+- `DELETE /materials/{id}` — убрать материал из базы поиска.
 
 Распаковка кода — на ВМ с платформой 1С 8.3.27 (путь к `1cv8` в `.env`):
 
@@ -95,12 +113,12 @@ uv run copilot1c unpack data/cfe/KS.cfe data/dumps/ks --extension КС_Дора�
 ## Демон ядра
 
 `copilot1c serve` поднимает HTTP API ядра только на `127.0.0.1:8100` — для веба, бота и MCP.
-Секреты (`.env`) и состояние (`.cache`: манифест индекса, кэш OCR) остаются у демона.
+Секреты (`.env`) и состояние (`.cache`: кэш OCR, журналы) остаются у демона.
 
 ```bash
 uv sync --extra server
 uv run copilot1c serve
-curl -s http://127.0.0.1:8100/health   # AI Studio, индекс и манифест, PostgreSQL, платформа 1С
+curl -s http://127.0.0.1:8100/health   # AI Studio, база поиска, PostgreSQL, платформа 1С
 ```
 
 На хосте — служба systemd `deploy/copilot1c-core.service` (пользователь `copilot`, каталог `/opt/1c-copilot`):

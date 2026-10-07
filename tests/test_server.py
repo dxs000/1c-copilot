@@ -7,20 +7,20 @@ from copilot1c.config import Settings
 
 
 def _client(monkeypatch, pg_ok: bool, **kw) -> TestClient:
-    monkeypatch.setattr(server, "_check_postgres", lambda s: {"ok": pg_ok, "tables": 9} if pg_ok else
-                        {"ok": False, "detail": "нет подключения"})
-    s = Settings(yc_api_key="AQVN-test-key", yc_folder_id="b1g", vector_store_id="vs1", onec_bin="/nonexistent",
+    ok = {"ok": True, "tables": 9, "chunks": 3, "searchable": 2}
+    monkeypatch.setattr(server, "_check_postgres", lambda s: ok if pg_ok else {"ok": False, "detail": "нет подключения"})
+    s = Settings(yc_api_key="AQVN-test-key", yc_folder_id="b1g", onec_bin="/nonexistent",
                  pg_dsn="postgresql://copilot:secret@localhost:5432/copilot", **kw)
     return TestClient(server.create_app(s))
 
 
 def test_health_ok_without_platform_1c(monkeypatch, tmp_path):
-    (tmp_path / "vector_store").mkdir()
-    (tmp_path / "vector_store" / "vs1.json").write_text('{"a": "f1", "b": "f2"}')
     r = _client(monkeypatch, True, cache_dir=str(tmp_path), ocr_backend="none").get("/health")
     body = r.json()
     assert r.status_code == 200 and body["status"] == "ok"  # платформа 1С необязательна
-    assert body["checks"]["vector_store"]["manifest"] is True and body["checks"]["vector_store"]["chunks"] == 2
+    assert body["checks"]["search"] == {"ok": True, "backend": "postgres", "chunks": 2,
+                                        "embedding": "text-search-doc/latest"}
+    assert body["checks"]["vector_store"] == body["checks"]["search"]  # прежнее имя для веба
     assert body["checks"]["ai_studio"]["model"] and body["checks"]["ocr"]["backend"] == "none"
     assert body["checks"]["platform_1c"] == {"ok": False, "optional": True}
 
@@ -28,13 +28,13 @@ def test_health_ok_without_platform_1c(monkeypatch, tmp_path):
 def test_health_degraded_and_no_secrets(monkeypatch, tmp_path):
     r = _client(monkeypatch, False, cache_dir=str(tmp_path)).get("/health")
     body = r.json()
-    assert body["status"] == "degraded" and body["checks"]["vector_store"]["manifest"] is False
+    assert body["status"] == "degraded" and body["checks"]["search"]["ok"] is False
     assert "secret" not in r.text and "AQVN-test-key" not in r.text  # ни пароля БД, ни ключа AI Studio
     assert body["checks"]["postgres"]["host"] == "localhost:5432/copilot"
 
 
 def _ask_client(monkeypatch, **kw):
-    s = Settings(yc_api_key="AQVN-test-key", yc_folder_id="b1g", vector_store_id="vs1", onec_bin="/nonexistent",
+    s = Settings(yc_api_key="AQVN-test-key", yc_folder_id="b1g", onec_bin="/nonexistent",
                  intent_llm=False, **kw)  # без вызова модели для типа сообщения
     return TestClient(server.create_app(s))
 
@@ -58,7 +58,7 @@ def test_ask_returns_web_compatible_payload(monkeypatch):
 
 
 def test_ask_errors(monkeypatch):
-    c = TestClient(server.create_app(Settings(yc_api_key="", yc_folder_id="", vector_store_id="")))
+    c = TestClient(server.create_app(Settings(yc_api_key="", yc_folder_id="")))
     assert c.post("/ask", json={"question": "Почему не 11.6?"}).status_code == 503
     assert c.post("/ask", json={"question": "?"}).status_code == 422  # слишком короткий вопрос
 

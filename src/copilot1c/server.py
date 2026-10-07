@@ -4,7 +4,8 @@
 (.env с ключом AI Studio, DSN PostgreSQL) остаются у демона.
 
 Методы появляются по шагам; сейчас:
-  GET /health — что видит ядро: настройки AI Studio, индекс и его манифест, PostgreSQL, платформа 1С.
+  GET /health — что видит ядро: настройки AI Studio, база поиска (фрагменты с эмбеддингами), PostgreSQL,
+               платформа 1С.
   POST /ask  — вопрос агенту: ответ, найденные фрагменты-источники, шаги агента. Формат ответа совпадает
                с /api/ask веб-части, чтобы веб проксировал запрос без изменений интерфейса. Плюс intent — тип
                сообщения (вопрос, проблема, сводка, документ, знание) и issue_draft — черновик обращения, если
@@ -19,6 +20,9 @@
   POST /materials — загрузить файлы (multipart, поле files): сохраняются в data/uploads, попадают в реестр.
   GET  /materials, GET /materials/{id} — реестр загруженных материалов и их статусы. Обработку
                (разбор → индексация → запись в базу) ведёт фоновый поток, см. worker.py.
+  DELETE /materials/{id} — убрать фрагменты материала из базы поиска (файл и запись реестра остаются,
+               статус «удалён»; повторная загрузка того же файла ставит его в очередь заново).
+  GET /contours, POST /contours, PATCH /contours/{id} — справочник контуров (система / процесс / проект).
   Обращения (issues.py) — проблемы, которые заводят аналитики:
   GET   /issues/meta — справочники (статусы, категории, приоритеты) и список аналитиков;
   GET   /issues — список с фильтрами (status, priority, category, assignee, open, q);
@@ -62,8 +66,9 @@ def _check_postgres(s: Settings) -> dict[str, Any]:
         tables = g.query("SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'public'")
         out: dict[str, Any] = {"ok": True, "tables": tables[0]["n"] if tables else 0}
         try:  # счётчики для веба; без схемы (до init-db) — только число таблиц
-            out.update(g.query("SELECT (SELECT count(*) FROM chunks) AS chunks, (SELECT count(*) FROM test_cases) "
-                               "AS test_cases, (SELECT count(*) FROM requirements) AS requirements")[0])
+            out.update(g.query("SELECT (SELECT count(*) FROM chunks) AS chunks, (SELECT count(*) FROM chunks WHERE "
+                               "embedding IS NOT NULL AND status = 'active') AS searchable, (SELECT count(*) FROM "
+                               "test_cases) AS test_cases, (SELECT count(*) FROM requirements) AS requirements")[0])
         except Exception as exc:  # noqa: BLE001
             out["detail"] = f"схема не создана (copilot1c init-db): {type(exc).__name__}"
         return out
@@ -71,13 +76,6 @@ def _check_postgres(s: Settings) -> dict[str, Any]:
         return {"ok": False, "detail": f"{type(exc).__name__}"}
     finally:
         g.close()
-
-
-def _manifest_chunks(path: Path) -> int:
-    try:
-        return len(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return 0
 
 
 def _check_writable(folder: Path) -> dict[str, Any]:
@@ -98,25 +96,44 @@ def _check_writable(folder: Path) -> dict[str, Any]:
 def health_report(s: Settings) -> dict[str, Any]:
     from copilot1c.ingest.ocr import backend
 
-    manifest = Path(s.cache_dir or ".cache") / "vector_store" / f"{s.vector_store_id}.json"
-    has_manifest = manifest.exists() if s.vector_store_id else False
+    pg = {**_check_postgres(s), "host": s.pg_dsn.rsplit("@", 1)[-1]}  # без логина и пароля
+    search = {"ok": bool(pg["ok"] and "searchable" in pg), "backend": "postgres",
+              "chunks": pg.get("searchable", 0), "embedding": s.embedding_doc}
     checks = {
         "ai_studio": {"ok": bool(s.yc_api_key and s.yc_folder_id), "folder": s.yc_folder_id or None,
                       "model": s.model_orchestrator},
-        "vector_store": {"ok": bool(s.vector_store_id), "id": s.vector_store_id or None,
-                         "manifest": has_manifest, "chunks": _manifest_chunks(manifest) if has_manifest else 0},
-        "postgres": {**_check_postgres(s), "host": s.pg_dsn.rsplit("@", 1)[-1]},  # без логина и пароля
+        "search": search,
+        "vector_store": search,  # прежнее имя — для веба до web-0011
+        "postgres": pg,
         "platform_1c": {"ok": Path(s.onec_bin).exists(), "optional": True},
         "ocr": {"ok": True, "backend": backend(s), "optional": True},
         "issues_files": _check_writable(Path(s.issues_dir)),
     }
-    required_ok = all(checks[k]["ok"] for k in ("ai_studio", "vector_store", "postgres"))
+    required_ok = all(checks[k]["ok"] for k in ("ai_studio", "search", "postgres"))
     return {"status": "ok" if required_ok else "degraded", "version": __version__, "project": s.project,
             "checks": checks}
 
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=2000)
+
+
+class ContourIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: str
+    name: str = Field(min_length=1, max_length=200)
+    parent_id: int | None = None
+    aliases: list[str] = Field(default_factory=list)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class ContourPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    parent_id: int | None = None
+    aliases: list[str] | None = None
+    notes: str | None = Field(default=None, max_length=4000)
+    active: bool | None = None
 
 
 class ClassifyRequest(BaseModel):
@@ -141,11 +158,17 @@ def classify_message(s: Settings, text: str, has_files: bool = False, use_llm: b
 
 def search_sources(s: Settings, question: str, k: int = 8) -> list[dict[str, Any]]:
     """Те же фрагменты, что агент получает перед ответом (тот же запрос и тот же поиск ядра)."""
-    from copilot1c.index.yandex import VectorIndex
+    from copilot1c.graph.store import try_connect
     from copilot1c.retrieval import smart_search, source_label
+    from copilot1c.search import PgIndex, search_fn
 
-    index = VectorIndex(s.vector_store_id, s)
-    hits = smart_search(lambda q, f, kk: index.search(q, filters=f, k=kk), question, {"project": s.project}, k)
+    g = try_connect(s)
+    if g is None:
+        raise RuntimeError("PostgreSQL недоступен — поиск по базе проекта невозможен")
+    try:
+        hits = smart_search(search_fn(PgIndex(g.conn, s)), question, {"project": s.project}, k)
+    finally:
+        g.close()
     out = []
     for i, h in enumerate(hits, 1):
         attrs = h.get("attributes") or {}
@@ -160,7 +183,7 @@ def run_question(s: Settings, question: str, attached: str = "", search_query: s
 
     store = try_connect(s)
     try:
-        ctx = ToolContext(s, s.vector_store_id, Path("data/dumps"), store)
+        ctx = ToolContext(s, Path("data/dumps"), store)
         if attached or search_query:
             return run_agent(question, ctx, attached=attached, search_query=search_query)
         return run_agent(question, ctx)
@@ -356,8 +379,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
     @app.post("/ask")
     def ask(req: AskRequest) -> dict[str, Any]:
         # Синхронный обработчик: FastAPI выполняет его в пуле потоков, долгий ответ агента не блокирует /health
-        if not (s.yc_api_key and s.yc_folder_id and s.vector_store_id):
-            raise HTTPException(503, "Не настроены ключи Yandex или COPILOT_VECTOR_STORE_ID в .env ядра")
+        if not (s.yc_api_key and s.yc_folder_id):
+            raise HTTPException(503, "Не настроены ключи Yandex AI Studio в .env ядра")
         question = req.question.strip()
         t0 = time.monotonic()
         kind = classify_message(s, question)
@@ -365,7 +388,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             sources = search_sources(s, question)
             result = run_question(s, question)
         except Exception as exc:  # noqa: BLE001 — клиенту причина текстом, а не 500 без объяснения
-            raise HTTPException(502, f"Ошибка обращения к Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
+            raise HTTPException(502, f"Ошибка поиска или Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
@@ -378,8 +401,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         from copilot1c.chat_files import MAX_FILES, context_block, extract
         from copilot1c.materials import MAX_UPLOAD_BYTES
 
-        if not (s.yc_api_key and s.yc_folder_id and s.vector_store_id):
-            raise HTTPException(503, "Не настроены ключи Yandex или COPILOT_VECTOR_STORE_ID в .env ядра")
+        if not (s.yc_api_key and s.yc_folder_id):
+            raise HTTPException(503, "Не настроены ключи Yandex AI Studio в .env ядра")
         if len(files) > MAX_FILES:
             raise HTTPException(413, f"Не больше {MAX_FILES} файлов к одному вопросу")
         question = question.strip()
@@ -403,7 +426,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             sources = search_sources(s, search_query or question)
             result = run_question(s, question, attached, search_query)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(502, f"Ошибка обращения к Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
+            raise HTTPException(502, f"Ошибка поиска или Yandex AI Studio: {type(exc).__name__}: {str(exc)[:300]}") \
                 from exc
         return {"answer": result.answer, "sources": sources, "seconds": round(time.monotonic() - t0, 1),
                 "steps": result.steps, "tools": [t.get("tool", "") for t in result.trace], **kind,
@@ -519,6 +542,63 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         if row is None:
             raise HTTPException(404, "Материал не найден")
         return row_out(row)
+
+    @app.delete("/materials/{material_id}")
+    def material_delete(material_id: int) -> dict[str, Any]:
+        """Фрагменты материала — из базы поиска; файл и запись реестра остаются (статус «удалён»)."""
+        from copilot1c.materials import ACTIVE, row_out
+        from copilot1c.search import PgIndex
+
+        g, reg = _registry(s)
+        try:
+            row = reg.get(material_id)
+            if row is None:
+                raise HTTPException(404, "Материал не найден")
+            if row["status"] in ACTIVE:
+                raise HTTPException(409, "Материал ещё обрабатывается — удалить можно после окончания")
+            removed = PgIndex(g.conn, s).delete_material(material_id)
+            g.conn.commit()
+            reg.set_status(material_id, "deleted", f"удалено из базы фрагментов: {removed}")
+            return {"removed_chunks": removed, "material": row_out(reg.get(material_id))}
+        finally:
+            g.close()
+
+    # ---------- контуры ----------
+
+    @app.get("/contours")
+    def contours_list(all: bool = False) -> dict[str, Any]:  # noqa: A002 — имя параметра запроса
+        from copilot1c.contours import ContourRegistry
+
+        g, _ = _registry(s)
+        try:
+            return {"contours": ContourRegistry(g.conn, s.project).list(include_inactive=all),
+                    "kinds": ContourRegistry.KINDS}
+        finally:
+            g.close()
+
+    @app.post("/contours")
+    def contours_create(req: ContourIn) -> dict[str, Any]:
+        from copilot1c.contours import ContourError, ContourRegistry
+
+        g, _ = _registry(s)
+        try:
+            return ContourRegistry(g.conn, s.project).create(req.model_dump(exclude_none=True))
+        except ContourError as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
+        finally:
+            g.close()
+
+    @app.patch("/contours/{contour_id}")
+    def contours_patch(contour_id: int, req: ContourPatch) -> dict[str, Any]:
+        from copilot1c.contours import ContourError, ContourRegistry
+
+        g, _ = _registry(s)
+        try:
+            return ContourRegistry(g.conn, s.project).update(contour_id, req.model_dump(exclude_unset=True))
+        except ContourError as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
+        finally:
+            g.close()
 
     # ---------- обращения ----------
     # Ошибки данных (неизвестный статус, пустая тема) — 422 с текстом; обращения нет — 404;

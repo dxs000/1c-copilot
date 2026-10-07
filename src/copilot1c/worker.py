@@ -8,10 +8,9 @@
    уже обработанные загрузки и текущая пачка — строго в порядке загрузки. Так работает склейка дублей
    ядра (письмо файлом, вложением и цитатой; документ docx и PDF): «главным» остаётся то, что было в
    базе раньше, и уже проиндексированные фрагменты не меняют идентификаторы.
-2. Индексация. Корпус уходит в Vector Store; манифест пропускает всё, что уже загружено, — в индекс
-   попадают только новые фрагменты.
-3. Запись в базу. Фрагменты, реестры тест-кейсов и плана, сущности — в PostgreSQL (вставки
-   идемпотентны).
+2. Индексация. Новые фрагменты (которых ещё нет в таблице chunks) получают эмбеддинги и записываются
+   в базу поиска (search.PgIndex) с отметкой, из какого материала пришли.
+3. Запись в базу. Реестры тест-кейсов и плана, сущности — в PostgreSQL (вставки идемпотентны).
 
 Итог по каждому файлу: «готово» (добавлено N фрагментов), «уже есть» (всё содержимое уже было в
 базе — с указанием, где именно) или «ошибка» (с причиной). После перезапуска службы прерванная
@@ -81,12 +80,13 @@ def _where_already(corpus, path: str) -> list[str]:
 
 
 def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) -> None:
-    """Обрабатывает пачку записей реестра (уже в статусе parsing). index — VectorIndex (подменяется в тестах)."""
+    """Обрабатывает пачку записей реестра (уже в статусе parsing). index — search.PgIndex (в тестах — с
+    поддельными эмбеддингами)."""
     from copilot1c.graph.store import GraphStore
-    from copilot1c.index.yandex import VectorIndex
     from copilot1c.ingest.corpus import Corpus
     from copilot1c.ingest.entities import extract_regex_entities
     from copilot1c.materials import MaterialRegistry
+    from copilot1c.search import PgIndex
 
     reg = MaterialRegistry(conn, s.project)
     summaries: dict[int, tuple[dict[str, Any], int]] = {}
@@ -111,20 +111,21 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
                 corpus.add_paths([p])
         chunks = corpus.chunks()
 
-        index = index or VectorIndex(s.vector_store_id, s)
-        before = set(index.load_manifest())
+        index = index or PgIndex(conn, s)
+        before = index.known_ids(c.chunk_id for c in chunks)
         for m in batch:  # подпись этапа — по самому файлу, а не по всей пачке
             own_new = sum(c.chunk_id not in before for c in chunks if _owned(c.source, m["path"]))
-            reg.set_status(m["id"], "indexing", f"загружаю в индекс новые фрагменты: {own_new}" if own_new else
+            reg.set_status(m["id"], "indexing", f"записываю в базу поиска новые фрагменты: {own_new}" if own_new else
                            "новых фрагментов в файле нет — жду окончания обработки пачки")
-        ids = index.add(chunks)
+        for m in batch:  # фрагменты материала — с его id: по нему материал удаляется из базы
+            index.add([c for c in chunks if _owned(c.source, m["path"])], material_id=m["id"])
+        index.add(chunks)  # остальное (основные материалы data, прежние загрузки), если ещё не в базе
 
         for m in batch:
-            reg.set_status(m["id"], "graph", "записываю фрагменты и реестры в PostgreSQL")
+            reg.set_status(m["id"], "graph", "записываю реестры и сущности в PostgreSQL")
         store = GraphStore.__new__(GraphStore)  # то же подключение, без второго коннекта
         store.conn = conn
         fresh = [c for c in chunks if c.chunk_id not in before]
-        store.upsert_chunks(chunks, ids)
         for d in corpus.documents:
             store.upsert_registries(s.project, d)
         for c in fresh:
@@ -151,7 +152,7 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
                                                         " (те же письма и документы уже в базе проекта)")
             reg.set_status(m["id"], "duplicate", detail[:500], report)
         elif new == 0:
-            reg.set_status(m["id"], "duplicate", "все фрагменты уже были в индексе", report)
+            reg.set_status(m["id"], "duplicate", "все фрагменты уже были в базе", report)
         else:
             reg.set_status(m["id"], "done", f"добавлено фрагментов: {new} из {len(mine)}", report)
 

@@ -108,7 +108,7 @@ def test_llm_says_not_an_issue_and_llm_failure(monkeypatch):
 
 
 def test_classify_endpoint_and_ask_payload(monkeypatch):
-    s = Settings(yc_api_key="", yc_folder_id="", vector_store_id="", onec_bin="/nonexistent")
+    s = Settings(yc_api_key="", yc_folder_id="", onec_bin="/nonexistent")
     c = TestClient(server.create_app(s))
     r = c.post("/classify", json={"text": f"После обновления не проводится реализация.\n{ERROR}"}).json()
     assert r["intent"]["primary"] == "issue" and r["issue_draft"]["error_text"] == ERROR

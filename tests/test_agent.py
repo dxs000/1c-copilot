@@ -61,7 +61,7 @@ def _ctx(monkeypatch, chat):
 
     monkeypatch.setattr(agent, "_search", fake_search)
     s = Settings(onec_bin="/nonexistent")
-    return agent.ToolContext(s, "vs", Path("/nonexistent")), searches
+    return agent.ToolContext(s, Path("/nonexistent")), searches
 
 
 def test_answers_immediately_from_prefetched_fragments(monkeypatch):

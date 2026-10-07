@@ -1,4 +1,4 @@
-"""Фоновая обработка загруженных материалов (worker.py) на живом PostgreSQL и поддельном Vector Store.
+"""Фоновая обработка загруженных материалов (worker.py) на живом PostgreSQL с поддельными эмбеддингами.
 
 Нужна переменная COPILOT_TEST_PG_DSN (пустая тестовая база); без неё тесты пропускаются.
 """
@@ -8,32 +8,29 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from fixtures.fake_embed import fake_embed
 from fixtures.synthetic import make_eml, make_pimi, make_tz
 
 from copilot1c import server, worker
 from copilot1c.config import Settings
 from copilot1c.ingest.corpus import Corpus
+from copilot1c.search import PgIndex
 
 PG_DSN = os.environ.get("COPILOT_TEST_PG_DSN")
 pytestmark = pytest.mark.skipif(not PG_DSN, reason="нет COPILOT_TEST_PG_DSN — тесты с PostgreSQL пропущены")
 
 
-class FakeIndex:
-    """Vector Store с манифестом в памяти: запоминает, что загружалось."""
+class FakeIndex(PgIndex):
+    """База поиска в PostgreSQL с поддельными эмбеддингами; запоминает, какие фрагменты записывались."""
 
-    def __init__(self, manifest: dict[str, str] | None = None):
-        self.manifest = dict(manifest or {})
+    def __init__(self, conn, s):
+        super().__init__(conn, s, embed=fake_embed)
         self.uploaded: list[str] = []
 
-    def load_manifest(self):
-        return dict(self.manifest)
-
-    def add(self, chunks, progress=None):
-        for c in chunks:
-            if c.chunk_id not in self.manifest:
-                self.manifest[c.chunk_id] = f"file-{c.chunk_id}"
-                self.uploaded.append(c.chunk_id)
-        return {c.chunk_id: self.manifest[c.chunk_id] for c in chunks}
+    def add(self, chunks, **kw):
+        new = super().add(chunks, **kw)
+        self.uploaded += new
+        return new
 
 
 @pytest.fixture
@@ -46,15 +43,17 @@ def env(tmp_path, monkeypatch):
     make_eml(data / "mails" / "RE Обновление.eml")
     make_tz(data / "ТЗ ред2.docx")
     s = Settings(pg_dsn=PG_DSN, project="test-proj", ocr_backend="none", cache_dir="", yc_api_key="k",
-                 yc_folder_id="f", vector_store_id="vs", onec_bin="/nonexistent")
+                 yc_folder_id="f", onec_bin="/nonexistent")
     g = GraphStore(settings=s)
     g.init_schema()
-    for t in ("materials", "chunks", "mentions", "test_cases", "requirements", "requirement_tests"):
-        g.conn.execute(f"TRUNCATE {t} RESTART IDENTITY CASCADE")
+    for t in ("mentions", "relations", "materials", "chunks", "test_cases", "requirements", "requirement_tests"):
+        g.conn.execute(f"DELETE FROM {t}")
     g.conn.commit()
-    # Индекс как после «index-docs data»: все основные материалы уже загружены
+    # База как после «index-docs data»: все основные материалы уже записаны
     base = Corpus(project=s.project, settings=s).add_paths([data]).chunks()
-    index = FakeIndex({c.chunk_id: f"file-{c.chunk_id}" for c in base})
+    index = FakeIndex(g.conn, s)
+    index.add(base)
+    index.uploaded = []
     yield s, g, index, tmp_path
     g.close()
 
@@ -92,8 +91,10 @@ def test_new_document_duplicate_email_and_unreadable_file(env, tmp_path):
     bad = got["обработка.epf"]
     assert bad["status"] == "error" and "неподдерживаемый тип .epf" in bad["detail"]
 
-    # в индекс ушли только фрагменты нового документа, основные материалы не перезаливались
+    # в базу ушли только фрагменты нового документа, основные материалы не перезаписывались
     assert len(index.uploaded) == new["report"]["chunks_new"]
+    owned = g.query("SELECT count(*) AS n FROM chunks WHERE material_id = %s", (new["id"],))[0]["n"]
+    assert owned == new["report"]["chunks_new"]  # по material_id материал можно убрать из базы
     n = g.query("SELECT count(*) AS n FROM test_cases WHERE project = 'test-proj'")[0]["n"]
     assert n == new["report"]["documents"][0]["test_cases"]
     pg_chunks = g.query("SELECT count(*) AS n FROM chunks WHERE source LIKE 'data/uploads/%%'")[0]["n"]
@@ -162,14 +163,14 @@ def test_indexing_detail_is_per_file(env, tmp_path):
     seen = {}
 
     class Spy(FakeIndex):
-        def add(self, chunks, progress=None):
+        def add(self, chunks, **kw):
             for r in g.query("SELECT filename, detail FROM materials WHERE project = 'test-proj'"):
-                seen[r["filename"]] = r["detail"]
-            return super().add(chunks)
+                seen.setdefault(r["filename"], r["detail"])
+            return super().add(chunks, **kw)
 
-    spy = Spy(index.manifest)
+    spy = Spy(g.conn, s)
     _upload(s, [("ПиМИ.docx", make_pimi(tmp_path / "p.docx").read_bytes()),
                 ("копия.eml", (root / "data" / "mails" / "RE Обновление.eml").read_bytes())])
     _run(s, g, spy)
-    assert seen["ПиМИ.docx"].startswith("загружаю в индекс новые фрагменты: ")
+    assert seen["ПиМИ.docx"].startswith("записываю в базу поиска новые фрагменты: ")
     assert seen["копия.eml"].startswith("новых фрагментов в файле нет")

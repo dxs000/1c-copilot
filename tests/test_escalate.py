@@ -74,7 +74,7 @@ def test_store_load_and_name(tmp_path):
 
 
 def test_agent_recommends_escalation(tmp_path):
-    ctx = ToolContext(_settings(tmp_path), "vs", Path("x"), None)
+    ctx = ToolContext(_settings(tmp_path), Path("x"), None)
     assert "prepare_escalation" in {t["function"]["name"] for t in available_tools(ctx)}
     r = make_handlers(ctx)["prepare_escalation"]("нет данных", "Как перенести реквизит?")
     assert r["ok"] and ctx.escalation == {"reason": "нет данных", "expert_question": "Как перенести реквизит?"}

@@ -13,7 +13,7 @@ from copilot1c.config import Settings
 
 
 def _settings(**kw):
-    return Settings(ocr_backend="none", yc_api_key="k", yc_folder_id="f", vector_store_id="vs", onec_bin="/nonexistent",
+    return Settings(ocr_backend="none", yc_api_key="k", yc_folder_id="f", onec_bin="/nonexistent",
                     intent_llm=False, internal_domains=DOMAINS, analyst_emails=ANALYST_EMAILS, analysts=ANALYSTS, **kw)
 
 
@@ -64,7 +64,7 @@ def test_ask_files_errors():
     c = TestClient(server.create_app(_settings()))
     many = [("files", (f"{i}.txt", b"x", "text/plain")) for i in range(cf.MAX_FILES + 1)]
     assert c.post("/ask/files", data={"question": "Что тут?"}, files=many).status_code == 413
-    no_keys = TestClient(server.create_app(Settings(yc_api_key="", yc_folder_id="", vector_store_id="")))
+    no_keys = TestClient(server.create_app(Settings(yc_api_key="", yc_folder_id="")))
     assert no_keys.post("/ask/files", data={"question": "Что тут?"},
                         files=[("files", ("a.txt", b"x", "text/plain"))]).status_code == 503
 

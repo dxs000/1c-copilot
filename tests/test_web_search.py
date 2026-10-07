@@ -110,10 +110,10 @@ def test_read_page_blocks_internal_and_extracts_text(tmp_path, monkeypatch):
 
 def test_agent_tools_limits_and_sources(tmp_path, monkeypatch):
     s = _settings(tmp_path, web_max_searches=2, web_max_pages=1)
-    ctx = ToolContext(s, "vs", Path("data/dumps"), None)
+    ctx = ToolContext(s, Path("data/dumps"), None)
     names = {t["function"]["name"] for t in available_tools(ctx)}
     assert {"web_search", "read_page"} <= names
-    off = ToolContext(_settings(tmp_path, web_search=False), "vs", Path("x"), None)
+    off = ToolContext(_settings(tmp_path, web_search=False), Path("x"), None)
     assert "web_search" not in {t["function"]["name"] for t in available_tools(off)}
 
     monkeypatch.setattr(web, "web_search", lambda q, settings, sites=None: {
@@ -130,7 +130,7 @@ def test_agent_tools_limits_and_sources(tmp_path, monkeypatch):
     assert ctx.web_sources == [{"title": "ИТС", "url": "https://its.1c.ru/1", "domain": "its.1c.ru", "read": True}]
 
     monkeypatch.setattr(web, "web_search", lambda *a, **kw: (_ for _ in ()).throw(web.WebError("пусто")))
-    ctx2 = ToolContext(s, "vs", Path("x"), None)
+    ctx2 = ToolContext(s, Path("x"), None)
     assert make_handlers(ctx2)["web_search"]("x")["error"] == "пусто"  # ошибка — агенту текстом
 
 

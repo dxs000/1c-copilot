@@ -98,14 +98,14 @@ def test_agent_gets_issues_before_first_call(store, monkeypatch):
     chat = OneShot()
     monkeypatch.setattr(agent, "client", lambda st: SimpleNamespace(chat=SimpleNamespace(completions=chat)))
     monkeypatch.setattr(agent, "_search", lambda ctx, q, f, k: [])
-    ctx = agent.ToolContext(s, "vs", Path("x"), g)
+    ctx = agent.ToolContext(s, Path("x"), g)
     r = agent.run_agent(f"Снова ошибка при проведении реализации: {ERROR}", ctx)
     first = chat.requests[0]["messages"][1]["content"]
     assert "Похожие зарегистрированные обращения — возможные дубли" in first and "ОБР-0001" in first
     assert r.issues and r.issues[0]["number"] == "ОБР-0001"
     names = {t["function"]["name"] for t in chat.requests[0]["tools"]}
     assert {"get_issue", "search_issues"} <= names
-    without_db = agent.available_tools(agent.ToolContext(s, "vs", Path("x")))
+    without_db = agent.available_tools(agent.ToolContext(s, Path("x")))
     assert "get_issue" not in {t["function"]["name"] for t in without_db}
     h = agent.make_handlers(ctx)
     assert h["get_issue"]("1")["номер"] == "ОБР-0001" and h["search_issues"]("бланк")[0]["номер"] == "ОБР-0002"

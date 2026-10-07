@@ -1,4 +1,4 @@
-"""Запись чанков, сущностей и связей в PostgreSQL."""
+"""Подключение к PostgreSQL: схема, сущности и связи графа, реестры. Фрагменты и поиск — search.PgIndex."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from psycopg.rows import dict_row
 
 from copilot1c.config import Settings, get_settings
 from copilot1c.ingest.document import ParsedDocument
-from copilot1c.models import Chunk, Entity, Relation
+from copilot1c.models import Entity, Relation
 
 
 def try_connect(settings: Settings | None = None) -> GraphStore | None:
-    """Граф необязателен: без PostgreSQL индексация и поиск работают, недоступны только реестры и SQL."""
+    """None, если PostgreSQL недоступен: тогда нет ни поиска по базе, ни реестров, ни обращений."""
     try:
         return GraphStore(settings=settings)
     except psycopg.OperationalError:
@@ -43,23 +43,6 @@ class GraphStore:
     def init_schema(self) -> None:
         sql = resources.files("copilot1c.graph").joinpath("schema.sql").read_text(encoding="utf-8")
         self.conn.execute(sql)
-
-    def upsert_chunks(self, chunks: Iterable[Chunk], vs_ids: dict[str, str] | None = None) -> None:
-        vs_ids = vs_ids or {}
-        with self.conn.cursor() as cur:
-            cur.executemany(
-                """INSERT INTO chunks (chunk_id, project, doc_type, source, title, doc_version, created_at,
-                                       author, objects, attrs, text, vs_file_id)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (chunk_id) DO UPDATE SET vs_file_id = COALESCE(EXCLUDED.vs_file_id,
-                                                                               chunks.vs_file_id)""",
-                [
-                    (c.chunk_id, c.project, c.doc_type.value, c.source, c.title, c.doc_version, c.date,
-                     c.author, c.objects, json.dumps(c.extra, ensure_ascii=False), c.text,
-                     vs_ids.get(c.chunk_id))
-                    for c in chunks
-                ],
-            )
 
     def upsert_entities(self, entities: Iterable[Entity], chunk_id: str | None = None) -> None:
         with self.conn.cursor() as cur:
