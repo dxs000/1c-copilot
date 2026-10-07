@@ -37,8 +37,27 @@ def embed(texts: Sequence[str], *, query: bool = False, settings: Settings | Non
     c = client(s)
     out: list[list[float]] = []
     for text in texts:  # модели AI Studio принимают по одному тексту за вызов
-        out.append(c.embeddings.create(model=model, input=text, encoding_format="float").data[0].embedding)
+        out.append(_embed_one(c, model, text))
     return out
+
+
+EMBED_MAX_CHARS = 6000  # модель эмбеддингов принимает не больше 2048 токенов; длинное письмо целиком не влезет
+
+
+def _embed_one(c, model: str, text: str) -> list[float]:
+    """Эмбеддинг по началу текста: если модель отвечает «слишком много токенов», текст укорачивается и запрос
+    повторяется. Вектор описывает начало фрагмента; полнотекстовый поиск всё равно идёт по всему тексту."""
+    from openai import BadRequestError
+
+    text = text[:EMBED_MAX_CHARS]
+    for _ in range(6):
+        try:
+            return c.embeddings.create(model=model, input=text, encoding_format="float").data[0].embedding
+        except BadRequestError as exc:
+            if "token" not in str(exc).lower() or len(text) < 200:
+                raise
+            text = text[: int(len(text) * 0.6)]
+    return c.embeddings.create(model=model, input=text, encoding_format="float").data[0].embedding
 
 
 def strict_schema(schema: dict[str, Any]) -> dict[str, Any]:

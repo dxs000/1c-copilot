@@ -225,7 +225,13 @@ def link_issue_emails(index: bool = typer.Option(True, help="Новые пись
             if not path.is_file():
                 typer.echo(f"ОБР-{r['issue_id']:04d}: нет файла {r['path']}", err=True)
                 continue
-            res = link_email(g.conn, s, r["issue_id"], r["filename"], path.read_bytes(), index=idx)
+            try:
+                res = link_email(g.conn, s, r["issue_id"], r["filename"], path.read_bytes(), index=idx)
+            except Exception as exc:  # noqa: BLE001 — одно письмо не останавливает остальные
+                g.conn.rollback()
+                typer.echo(f"ОБР-{r['issue_id']:04d} «{r['filename']}»: ошибка {type(exc).__name__}: {str(exc)[:300]}",
+                           err=True)
+                continue
             done += 1
             typer.echo(f"ОБР-{r['issue_id']:04d} «{r['filename']}»: ветки {res['threads']}, новых писем "
                        f"{res.get('letters_new', 0)}" + (f", номера заявок {', '.join(res['refs'])}" if res["refs"] else ""))

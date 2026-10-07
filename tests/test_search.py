@@ -219,3 +219,26 @@ def test_contour_match_handles_word_endings(pg):
     assert names("Описание процесса командировок и учета билетов") == ["Командировки"]
     assert names("Обновление УТ 11.5.27.75, «Управлении торговлей»") == ["УТ 11"]
     assert names("УТ 111 и командир") == []
+
+
+def test_embedding_shortens_text_when_model_rejects_tokens():
+    """AI Studio: «number of input tokens must be no more than 2048» — текст укорачивается и запрос повторяется."""
+    import httpx
+    from openai import BadRequestError
+
+    from copilot1c.index import yandex
+
+    sent = []
+
+    class Emb:
+        def create(self, model, input, encoding_format):  # noqa: A002
+            sent.append(len(input))
+            if len(input) > 1000:
+                resp = httpx.Response(400, request=httpx.Request("POST", "http://x/embeddings"))
+                raise BadRequestError("number of input tokens must be no more than 2048, got 4658", response=resp,
+                                      body=None)
+            return type("R", (), {"data": [type("D", (), {"embedding": [0.1, 0.2]})()]})()
+
+    c = type("C", (), {"embeddings": Emb()})()
+    assert yandex._embed_one(c, "emb://f/m", "слово " * 3000) == [0.1, 0.2]
+    assert sent[0] == yandex.EMBED_MAX_CHARS and sent[-1] <= 1000 and len(sent) > 2
