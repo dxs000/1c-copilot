@@ -46,6 +46,8 @@
         ничего не сохраняет. POST /issues/{id}/attachments с expand=true — письмо прикрепляется вместе
         с файлами, вложенными в него (скриншоты, логи);
   GET   /contacts?q=, POST /contacts — инициаторы обращений (сотрудники заказчика).
+  POST  /issues/suggest-contours — система и подсистема для обращения; GET /issues?contour= — фильтр по системе
+        с её подсистемами; POST /contours/seed — стартовый справочник (УТ 11, БП 3.0, ЗУП 3, инфраструктура).
   POST  /issues/triage (multipart files, question) — письмо по обращениям (mail_triage.py): что нового, к какому
         обращению относится, предложение «обновить ОБР-…» (что изменилось, комментарий, статус) / «новое» / «в базу».
         Письмо, прикреплённое к обращению, записывается в ветки переписки, ветка связывается с обращением, номера
@@ -259,6 +261,8 @@ class IssueFields(BaseModel):
     resolution: str | None = None
     kb_material_id: int | None = None
     external_refs: list[str] | None = None
+    contours: list[int] | None = None      # система и подсистема (id контуров)
+    transferred_to: str | None = None      # кому передано обращение не по профилю
 
 
 class IssueCreate(IssueFields):
@@ -879,6 +883,34 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         except VersionConflict as exc:
             raise HTTPException(409, {"message": str(exc), "current": exc.current}) from exc
 
+    @app.post("/issues/suggest-contours")
+    def issues_suggest_contours(req: RelatedIn) -> dict[str, Any]:
+        """Система и подсистема для обращения (черновика): объекты 1С, слова, модель; новый пункт справочника,
+        если подходящего нет."""
+        from copilot1c.contours import suggest
+
+        g, _ = _registry(s)
+        try:
+            text = "\n".join(x for x in (req.title, req.description, req.error_text) if x)
+            res = suggest(g.conn, s.project, text, req.objects, settings=s)
+            g.conn.rollback()
+            return res
+        finally:
+            g.close()
+
+    @app.post("/contours/seed")
+    def contours_seed() -> dict[str, Any]:
+        """Стартовый справочник: УТ 11, БП 3.0, ЗУП 3, инфраструктура и их функциональные блоки (повтор безопасен)."""
+        from copilot1c.contour_catalog import seed
+
+        g, _ = _registry(s)
+        try:
+            res = seed(g.conn, s.project)
+            g.conn.commit()
+            return res
+        finally:
+            g.close()
+
     @app.get("/issues/meta")
     def issues_meta() -> dict[str, Any]:
         from copilot1c.issues import meta
@@ -888,10 +920,11 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
     @app.get("/issues")
     def issues_list(status: str | None = None, priority: str | None = None, category: str | None = None,
                     assignee: str | None = None, open: bool = False, q: str | None = None,
-                    limit: int = 200) -> dict[str, Any]:
+                    limit: int = 200, contour: int | None = None) -> dict[str, Any]:
         g, reg = _issues(s)
         try:
-            return {"issues": reg.list(status, priority, category, assignee, q, open, min(max(limit, 1), 1000))}
+            return {"issues": reg.list(status, priority, category, assignee, q, open, min(max(limit, 1), 1000),
+                                       contour)}
         finally:
             g.close()
 
@@ -922,6 +955,14 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         try:
             changes = req.changes.model_dump(exclude_unset=True)
             issue = _call(lambda: reg.update(issue_id, changes, req.version, req.actor, req.comment))
+            if issue is not None and changes.get("contours") and issue.get("objects"):
+                # аналитик отнёс обращение к подсистеме — её объекты 1С становятся псевдонимами подсистемы
+                from copilot1c.contours import learn_objects
+
+                try:
+                    learn_objects(g.conn, s.project, issue["contours"], issue["objects"])
+                except Exception:  # noqa: BLE001 — обучение справочника не должно ломать сохранение
+                    g.conn.rollback()
         finally:
             g.close()
         if issue is None:
@@ -997,7 +1038,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             if issue is None:
                 raise HTTPException(404, "Обращение не найдено")
             material, seen = _call(lambda: publish(g.conn, s.project, issue, req.title, req.text,
-                                                   Path(s.materials_dir), base=Path.cwd(), analysts=s.analysts))
+                                                   Path(s.materials_dir), base=Path.cwd(), analysts=s.analysts,
+                                                   contours=issue.get("contours") or []))
             card = issue
             if issue.get("kb_material_id") != material["id"]:
                 note = f"Разбор отправлен в базу знаний: «{material['filename']}»"

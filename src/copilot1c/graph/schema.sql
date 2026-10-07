@@ -190,15 +190,29 @@ END $$;
 CREATE TABLE IF NOT EXISTS contours (
     id          bigserial PRIMARY KEY,
     project     text NOT NULL,
-    kind        text NOT NULL CHECK (kind IN ('system', 'process', 'project')),
+    kind        text NOT NULL CHECK (kind IN ('system', 'subsystem', 'process', 'project')),
     name        text NOT NULL,
     parent_id   bigint REFERENCES contours(id) ON DELETE SET NULL,
     aliases     text[] NOT NULL DEFAULT '{}',
     notes       text,
     active      boolean NOT NULL DEFAULT true,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (project, kind, name)
+    created_at  timestamptz NOT NULL DEFAULT now()
 );
+-- 07.10.2026: подсистема (функциональный блок системы: «УТ 11 › Продажи») — вид контура с родителем-системой
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'contours_project_kind_name_key') THEN
+        ALTER TABLE contours DROP CONSTRAINT contours_project_kind_name_key;  -- «Продажи» есть и в УТ, и в БП
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS contours_name_idx ON contours (project, kind, coalesce(parent_id, 0), lower(name));
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'contours_kind_check'
+               AND pg_get_constraintdef(oid) NOT LIKE '%subsystem%') THEN
+        ALTER TABLE contours DROP CONSTRAINT contours_kind_check;
+        ALTER TABLE contours ADD CONSTRAINT contours_kind_check
+            CHECK (kind IN ('system', 'subsystem', 'process', 'project'));
+    END IF;
+END $$;
 
 -- ===== Обращения (проблемы, о которых сообщают аналитики интегратора) =====
 -- Заводят обращения только аналитики интегратора (через веб или чат). Пользователи заказчика с системой
@@ -273,6 +287,16 @@ DO $$ BEGIN
     END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS issues_refs_idx ON issues USING gin (external_refs);
+-- Система и подсистема обращения (контуры), кому передано обращение не по профилю
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'issues' AND column_name = 'contours') THEN
+        ALTER TABLE issues ADD COLUMN contours bigint[] NOT NULL DEFAULT '{}';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'issues' AND column_name = 'transferred_to') THEN
+        ALTER TABLE issues ADD COLUMN transferred_to text;
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS issues_contours_idx ON issues USING gin (contours);
 CREATE UNIQUE INDEX IF NOT EXISTS issues_message_idx ON issues (project, source_message_id)
     WHERE source_message_id IS NOT NULL;
 

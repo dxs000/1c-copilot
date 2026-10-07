@@ -68,7 +68,19 @@ def get_issue(conn, project: str, ref: str | int) -> dict[str, Any]:
     issue = IssueRegistry(conn, project).get(n)
     if issue is None:
         return {"error": f"обращения {number(n)} нет"}
-    return card(issue)
+    out = card(issue)
+    if issue.get("contours"):  # система и подсистема — подписью «УТ 11 › Продажи»
+        from copilot1c.contours import ContourRegistry, path_label
+
+        items = {c["id"]: c for c in ContourRegistry(conn, project).list(include_inactive=True)}
+        chosen = [i for i in issue["contours"] if i in items]
+        parents = {items[i].get("parent_id") for i in chosen}
+        labels = [path_label(items[i], items) for i in chosen if i not in parents]  # система — только без блока
+        if labels:
+            out["система"] = "; ".join(labels)
+    if issue.get("transferred_to"):
+        out["передано"] = issue["transferred_to"]
+    return out
 
 
 def search_issues(conn, project: str, query: str, open_only: bool = False, k: int = 5) -> list[dict[str, Any]]:
@@ -130,8 +142,9 @@ def issue_context(conn, project: str, question: str) -> tuple[str, list[dict[str
 
 
 def _fmt(c: dict[str, Any]) -> str:
-    keys = ("тема", "статус", "приоритет", "ответственный", "инициатор", "сообщили", "объекты", "описание", "текст_ошибки",
-            "причина", "решение", "дубль_обращения", "тест_кейсы_ПиМИ", "пункты_ТЗ", "комментарии")
+    keys = ("тема", "система", "статус", "передано", "приоритет", "ответственный", "инициатор", "сообщили",
+            "объекты", "описание", "текст_ошибки", "причина", "решение", "дубль_обращения", "тест_кейсы_ПиМИ",
+            "пункты_ТЗ", "комментарии")
     lines = []
     for k in keys:
         v = c.get(k)

@@ -163,8 +163,10 @@ def compose(issue: dict[str, Any], settings=None, use_llm: bool = True) -> dict[
 
 
 def publish(conn, project: str, issue: dict[str, Any], title: str, text: str, materials_dir: Path,
-            base: Path | None = None, analysts: tuple[str, ...] = ()) -> tuple[dict[str, Any], bool]:
-    """Разбор → материал в реестре (дальше его обрабатывает фоновый поток демона). (материал, уже_был)."""
+            base: Path | None = None, analysts: tuple[str, ...] = (),
+            contours: list[int] | None = None) -> tuple[dict[str, Any], bool]:
+    """Разбор → материал в реестре (дальше его обрабатывает фоновый поток демона). (материал, уже_был).
+    contours — система и подсистема обращения: разбор находится в поиске по тем же контурам."""
     from copilot1c.materials import MaterialRegistry, register_upload
 
     text = _scrub(text or "", _names(issue, analysts), analysts).strip()
@@ -172,4 +174,5 @@ def publish(conn, project: str, issue: dict[str, Any], title: str, text: str, ma
         raise IssueError("Текст разбора слишком короткий")
     title = re.sub(r"\s+", " ", title or issue["title"]).strip()[:120]
     filename = f"Решение {number(issue['id'])} — {title}.md"
-    return register_upload(MaterialRegistry(conn, project), materials_dir, filename, text.encode("utf-8"), base=base)
+    return register_upload(MaterialRegistry(conn, project), materials_dir, filename, text.encode("utf-8"), base=base,
+                           decision={"action": "add", "contours": list(contours or []), "kind": "protocol"})

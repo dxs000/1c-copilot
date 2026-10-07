@@ -38,6 +38,7 @@ STATUSES = {
     "closed": "закрыто",
     "rejected": "отклонено",
     "duplicate": "дубль",
+    "transferred": "передано",   # не по профилю — передано другой команде (кому — transferred_to)
 }
 OPEN_STATUSES = ("new", "in_progress", "wait_customer", "wait_developer")
 CATEGORIES = {
@@ -60,7 +61,7 @@ EDITABLE = (
     "infobase", "server", "config_version", "platform_version", "objects",
     "initiator_contact_id", "reported_at", "registered_by", "source", "source_ref", "source_message_id",
     "classifier_confidence", "duplicate_of", "requirement_ids", "test_case_ids",
-    "root_cause", "resolution", "kb_material_id", "external_refs",
+    "root_cause", "resolution", "kb_material_id", "external_refs", "contours", "transferred_to",
 )
 _CHOICES = {"status": STATUSES, "category": CATEGORIES, "priority": PRIORITIES, "source": SOURCES}
 _ARRAYS = ("tags", "objects", "requirement_ids", "test_case_ids", "external_refs")
@@ -133,7 +134,12 @@ def _clean(changes: dict[str, Any]) -> dict[str, Any]:
     for k, v in changes.items():
         if isinstance(v, str):
             v = text_safe(v).strip() or None
-        if k in _ARRAYS:
+        if k == "contours":  # система и подсистема — id контуров
+            try:
+                v = list(dict.fromkeys(int(x) for x in (v or [])))
+            except (TypeError, ValueError) as exc:
+                raise IssueError("contours — список id контуров") from exc
+        elif k in _ARRAYS:
             v = list(dict.fromkeys(text_safe(str(x)).strip() for x in (v or []) if text_safe(str(x)).strip()))
         if k in _CHOICES and v not in _CHOICES[k]:
             raise IssueError(f"Неизвестное значение {k}: {v!r}; допустимо: {', '.join(_CHOICES[k])}")
@@ -186,9 +192,13 @@ class IssueRegistry:
 
     def list(self, status: str | None = None, priority: str | None = None, category: str | None = None,
              assignee: str | None = None, q: str | None = None, open_only: bool = False,
-             limit: int = 200) -> list[dict[str, Any]]:
-        """Строки таблицы «Обращения»: без длинных текстов, с именем инициатора и числом вложений."""
+             limit: int = 200, contour: int | None = None) -> list[dict[str, Any]]:
+        """Строки таблицы «Обращения»: без длинных текстов, с именем инициатора и числом вложений.
+        contour — система или подсистема: обращения с ней или с любой её подсистемой."""
         where, params = ["i.project = %s"], [self.project]
+        if contour:
+            where.append("i.contours && (SELECT array_agg(id) FROM contours WHERE id = %s OR parent_id = %s)")
+            params += [contour, contour]
         for field, value in (("status", status), ("priority", priority), ("category", category),
                              ("assignee", assignee)):
             if value:
@@ -209,7 +219,8 @@ class IssueRegistry:
             where.append(cond + ")")
         params.append(limit)
         rows = self._all(f"""
-            SELECT i.id, i.title, i.status, i.priority, i.category, i.objects, i.assignee, i.registered_by,
+            SELECT i.id, i.title, i.status, i.priority, i.category, i.objects, i.assignee, i.registered_by, i.contours,
+                   i.transferred_to,
                    i.source, i.reported_at, i.created_at, i.updated_at, i.due_date,
                    c.name AS initiator_name, c.organization AS initiator_org,
                    (SELECT count(*) FROM issue_attachments a WHERE a.issue_id = i.id) AS attachments

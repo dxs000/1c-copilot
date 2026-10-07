@@ -238,6 +238,12 @@ def triage(files: list[tuple[str, bytes]], question: str, conn, settings, use_ll
                                                               for x in new_letters],
             "agent_view": agent_view(chains), "candidates": briefs, "refs": external_refs(*_subjects(parsed)),
         }
+        if decision == "new":  # система и подсистема будущего обращения
+            from copilot1c.contours import suggest
+
+            item["contours"] = suggest(conn, settings.project, f"{parsed.message.subject}\n{new_text}",
+                                       settings=settings, use_llm=use_llm)
+            conn.rollback()
         if best:
             item["update"] = _update_proposal(best, new_letters, settings, use_llm)
             item["update"]["status_label"] = STATUSES.get(item["update"]["status"], item["update"]["status"])

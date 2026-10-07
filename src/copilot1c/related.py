@@ -85,7 +85,8 @@ def find_related(conn, project: str, issue: dict[str, Any], exclude_id: int | No
 
     # --- похожие обращения ---
     similar = []
-    for r in _rows(conn, "SELECT id, title, description, error_text, objects, status, created_at FROM issues "
+    mine = set(issue.get("contours") or [])
+    for r in _rows(conn, "SELECT id, title, description, error_text, objects, status, created_at, contours FROM issues "
                          "WHERE project = %s AND id IS DISTINCT FROM %s ORDER BY id DESC LIMIT 1000",
                    (project, exclude_id)):
         why, score = [], 0.0
@@ -101,6 +102,13 @@ def find_related(conn, project: str, issue: dict[str, Any], exclude_id: int | No
         if same_err:
             score += 0.6
             why.append("то же место ошибки: " + next(iter(same_err)))
+        theirs = set(r.get("contours") or [])
+        if mine and theirs:  # система и подсистема: та же — вероятнее дубль, разные системы — вряд ли
+            if mine & theirs:
+                score += 0.2
+                why.append("та же система")
+            else:
+                score *= 0.5
         if score >= ISSUE_MIN:
             similar.append({"id": r["id"], "title": r["title"], "status": r["status"], "score": round(score, 2),
                             "why": why, "created_at": r["created_at"]})

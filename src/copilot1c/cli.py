@@ -87,9 +87,15 @@ def init_db():
 
     from copilot1c.graph.store import GraphStore
 
+    s = get_settings()
     try:
-        with GraphStore() as g:
+        with GraphStore(settings=s) as g:
             g.init_schema()
+            if not g.query("SELECT 1 FROM contours WHERE project = %s LIMIT 1", (s.project,)):
+                from copilot1c.contour_catalog import seed  # пустой справочник — стартовые системы и блоки
+
+                r = seed(g.conn, s.project)
+                typer.echo(f"Справочник контуров: систем {r['systems']}, блоков {r['subsystems']}")
     except psycopg.Error as exc:  # понятное сообщение вместо трассировки (например, нет прав на pgvector)
         hint = getattr(exc.diag, "message_hint", None)
         typer.echo(f"Схема не создана: {exc.diag.message_primary or exc}" + (f"\n{hint}" if hint else ""), err=True)
@@ -177,7 +183,10 @@ def reset_knowledge(yes: bool = typer.Option(False, "--yes", help="Подтве�
 
 
 @app.command("contours")
-def contours_cmd(add: str = typer.Option(None, help="Добавить: «вид:название», вид — system, process или project"),
+def contours_cmd(add: str = typer.Option(None, help="Добавить: «вид:название», вид — system, subsystem, process "
+                                                    "или project"),
+                 seed_catalog: bool = typer.Option(False, "--seed", help="Стартовый справочник: УТ 11, БП 3.0, ЗУП 3, "
+                                                                          "инфраструктура и их блоки"),
                  parent: int = typer.Option(None, help="id родительского контура для --add"),
                  aliases: str = typer.Option("", help="Псевдонимы через запятую для --add"),
                  notes: str = typer.Option(None, help="Пояснения для агента для --add")):
@@ -187,6 +196,11 @@ def contours_cmd(add: str = typer.Option(None, help="Добавить: «вид:
     s = get_settings()
     with _connect() as g:
         reg = ContourRegistry(g.conn, s.project)
+        if seed_catalog:
+            from copilot1c.contour_catalog import seed
+
+            r = seed(g.conn, s.project)
+            typer.echo(f"Добавлено систем: {r['systems']}, блоков: {r['subsystems']}, псевдонимов: {r['aliases']}")
         if add:
             kind, _, name = add.partition(":")
             try:
@@ -236,6 +250,35 @@ def link_issue_emails(index: bool = typer.Option(True, help="Новые пись
             typer.echo(f"ОБР-{r['issue_id']:04d} «{r['filename']}»: ветки {res['threads']}, новых писем "
                        f"{res.get('letters_new', 0)}" + (f", номера заявок {', '.join(res['refs'])}" if res["refs"] else ""))
     typer.echo(f"Писем обработано: {done}")
+
+
+@app.command("suggest-issue-contours")
+def suggest_issue_contours(apply: bool = typer.Option(False, "--apply", help="Записать предложения в обращения "
+                                                                           "без системы"),
+                           llm: bool = typer.Option(True, help="Уточнять моделью спорные случаи")):
+    """Система и подсистема для уже заведённых обращений: показать предложения (или записать с --apply)."""
+    from copilot1c.contours import suggest
+    from copilot1c.issues import IssueRegistry
+
+    s = get_settings()
+    with _connect() as g:
+        reg = IssueRegistry(g.conn, s.project)
+        rows = g.query("SELECT id, version, title, description, error_text, objects, contours FROM issues "
+                       "WHERE project = %s ORDER BY id", (s.project,))
+        done = 0
+        for r in rows:
+            if r["contours"]:
+                continue
+            text = "\n".join(x for x in (r["title"], r["description"], r["error_text"]) if x)
+            res = suggest(g.conn, s.project, text, r["objects"] or [], settings=s, use_llm=llm)
+            label = "; ".join(res["labels"]) or "не определено" + (f" (новый пункт? {res['new']['label']})"
+                                                                     if res["new"] else "")
+            typer.echo(f"ОБР-{r['id']:04d} «{r['title'][:60]}» → {label}")
+            if apply and res["contours"]:
+                reg.update(r["id"], {"contours": res["contours"]}, r["version"], actor="система",
+                           comment="Система определена автоматически: " + "; ".join(res["labels"]))
+                done += 1
+    typer.echo(f"Записано: {done}" if apply else "Ничего не записано — повторите с --apply")
 
 
 @app.command("search")
