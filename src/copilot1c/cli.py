@@ -111,17 +111,26 @@ def index_docs(paths: list[Path],
                llm_entities: bool = typer.Option(False, help="Дополнительно извлекать сущности LLM")):
     """Проиндексировать почту и документы в базу поиска PostgreSQL (эмбеддинги AI Studio), граф и реестры."""
     from copilot1c.ingest.entities import extract_regex_entities
+    from copilot1c.letters import ingest_emails, results_report
     from copilot1c.search import PgIndex
 
     s = get_settings()
     corpus = _corpus(paths)
     typer.echo(corpus.report())
-    chunks = corpus.chunks()
-    typer.echo(f"Чанков: {len(chunks)}")
+    chunks = corpus.chunks(messages=False)
+    typer.echo(f"Фрагментов документов: {len(chunks)}")
 
     with _connect() as g:
-        new = set(PgIndex(g.conn, s).add(chunks, progress=typer.echo))
-        typer.echo(f"База поиска: новых фрагментов {len(new)}, всего фрагментов этого корпуса {len(chunks)}")
+        index = PgIndex(g.conn, s)
+        new = set(index.add(chunks, progress=typer.echo))
+        typer.echo(f"База поиска: новых фрагментов документов {len(new)} из {len(chunks)}")
+        results = ingest_emails(g.conn, s, corpus.emails, index)
+        mail = results_report(results)
+        typer.echo(f"Письма: новых {mail['letters_new']}, уже известных {mail['letters_known']}, "
+                   f"веток {len(mail['threads'])}")
+        letter_chunks = [x.chunk for r in results for x in r.new_letters]
+        chunks += letter_chunks
+        new |= {c.chunk_id for c in letter_chunks}
         for d in corpus.documents:
             g.upsert_registries(s.project, d)
         for c in chunks:
@@ -137,16 +146,17 @@ def index_docs(paths: list[Path],
     typer.echo("Граф и реестры записаны в PostgreSQL")
 
 
-KNOWLEDGE_TABLES = ("mentions", "relations", "entities", "requirement_tests", "requirements", "test_cases", "chunks",
-                    "bsl_calls", "bsl_methods", "md_objects")
+KNOWLEDGE_TABLES = ("mentions", "relations", "entities", "requirement_tests", "requirements", "test_cases", "letters",
+                    "threads", "chunks", "bsl_calls", "bsl_methods", "md_objects")
 
 
 @app.command("reset-knowledge")
 def reset_knowledge(yes: bool = typer.Option(False, "--yes", help="Подтверждение: без него ничего не удаляется"),
                     materials: bool = typer.Option(True, help="Убрать и реестр загрузок (файлы на диске остаются)")):
-    """Очистить базу знаний: фрагменты, граф, реестры (и реестр загрузок). Обращения и контакты не трогаются."""
+    """Очистить базу знаний: фрагменты, письма и ветки, граф, реестры (и реестр загрузок). Обращения, контакты и
+    контуры не трогаются."""
     if not yes:
-        typer.echo("Удалит все фрагменты, граф, реестры тест-кейсов и требований"
+        typer.echo("Удалит все фрагменты, письма и ветки, граф, реестры тест-кейсов и требований"
                    + (" и реестр загруженных материалов" if materials else "")
                    + ". Обращения, контакты и контуры останутся. Повторите с --yes.")
         raise typer.Exit(1)

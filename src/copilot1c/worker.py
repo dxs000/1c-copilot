@@ -8,8 +8,9 @@
    уже обработанные загрузки и текущая пачка — строго в порядке загрузки. Так работает склейка дублей
    ядра (письмо файлом, вложением и цитатой; документ docx и PDF): «главным» остаётся то, что было в
    базе раньше, и уже проиндексированные фрагменты не меняют идентификаторы.
-2. Индексация. Новые фрагменты (которых ещё нет в таблице chunks) получают эмбеддинги и записываются
-   в базу поиска (search.PgIndex) с отметкой, из какого материала пришли.
+2. Индексация. Новые фрагменты документов (которых ещё нет в таблице chunks) получают эмбеддинги и
+   записываются в базу поиска (search.PgIndex) с отметкой, из какого материала пришли. Письма сверяются
+   с известными ветками (letters.py): в базу идут только новые письма, сводка ветки пересобирается.
 3. Запись в базу. Реестры тест-кейсов и плана, сущности — в PostgreSQL (вставки идемпотентны).
 
 Итог по каждому файлу: «готово» (добавлено N фрагментов), «уже есть» (всё содержимое уже было в
@@ -85,6 +86,7 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
     from copilot1c.graph.store import GraphStore
     from copilot1c.ingest.corpus import Corpus
     from copilot1c.ingest.entities import extract_regex_entities
+    from copilot1c.letters import ingest_emails, results_report
     from copilot1c.materials import MaterialRegistry
     from copilot1c.search import PgIndex
 
@@ -109,7 +111,7 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
         for p in earlier + [m["path"] for m in batch]:
             if Path(p).exists():
                 corpus.add_paths([p])
-        chunks = corpus.chunks()
+        chunks = corpus.chunks(messages=False)  # письма — через ветки (letters.py): в базу только новые
 
         index = index or PgIndex(conn, s)
         before = index.known_ids(c.chunk_id for c in chunks)
@@ -117,8 +119,13 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
             own_new = sum(c.chunk_id not in before for c in chunks if _owned(c.source, m["path"]))
             reg.set_status(m["id"], "indexing", f"записываю в базу поиска новые фрагменты: {own_new}" if own_new else
                            "новых фрагментов в файле нет — жду окончания обработки пачки")
+        letters: dict[int, list] = {}
         for m in batch:  # фрагменты материала — с его id: по нему материал удаляется из базы
             index.add([c for c in chunks if _owned(c.source, m["path"])], material_id=m["id"])
+            own_emails = [e for e in corpus.emails if _owned(e.source, m["path"])]
+            if own_emails:
+                reg.set_status(m["id"], "indexing", "сверяю письма с известными ветками переписки")
+                letters[m["id"]] = ingest_emails(conn, s, own_emails, index, material_id=m["id"])
         index.add(chunks)  # остальное (основные материалы data, прежние загрузки), если ещё не в базе
 
         for m in batch:
@@ -126,6 +133,7 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
         store = GraphStore.__new__(GraphStore)  # то же подключение, без второго коннекта
         store.conn = conn
         fresh = [c for c in chunks if c.chunk_id not in before]
+        fresh += [x.chunk for res in letters.values() for r in res for x in r.new_letters]
         for d in corpus.documents:
             store.upsert_registries(s.project, d)
         for c in fresh:
@@ -142,19 +150,23 @@ def process_batch(batch: list[dict[str, Any]], conn, s: Settings, index=None) ->
         summary, alone = summaries[m["id"]]
         mine = [c for c in chunks if _owned(c.source, m["path"])]
         new = sum(c.chunk_id not in before for c in mine)
-        report = {**summary, "chunks": len(mine), "chunks_new": new, "already_in_base": _where_already(corpus, m["path"])}
+        mail = results_report(letters.get(m["id"], []))
+        report = {**summary, "chunks": len(mine) + mail["letters_new"], "chunks_new": new + mail["letters_new"],
+                  "already_in_base": _where_already(corpus, m["path"]), **mail}
+        threads = "; ".join(f"ветка «{t['title'][:80]}»: новых писем {t['new']}, известных {t['known']}"
+                            for t in mail["threads"])
         if alone == 0:
             reasons = "; ".join(f"{x['file']}: {x['reason']}" for x in summary["skipped"]) or "текст не найден"
             reg.set_status(m["id"], "error", f"нечего индексировать — {reasons}"[:500], report)
-        elif not mine:
-            where = report["already_in_base"]
+        elif new == 0 and mail["letters_new"] == 0:
+            where = report["already_in_base"] + ([threads] if threads else [])
             detail = "всё содержимое уже есть в базе" + (f": {'; '.join(where)}" if where else
                                                         " (те же письма и документы уже в базе проекта)")
             reg.set_status(m["id"], "duplicate", detail[:500], report)
-        elif new == 0:
-            reg.set_status(m["id"], "duplicate", "все фрагменты уже были в базе", report)
         else:
-            reg.set_status(m["id"], "done", f"добавлено фрагментов: {new} из {len(mine)}", report)
+            parts = [f"добавлено фрагментов документов: {new} из {len(mine)}"] if mine else []
+            parts += [threads] if threads else []
+            reg.set_status(m["id"], "done", "; ".join(parts)[:500], report)
 
 
 class MaterialWorker:

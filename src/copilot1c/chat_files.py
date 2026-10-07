@@ -76,17 +76,48 @@ def _document_text(name: str, data: bytes, settings) -> tuple[str, str]:
     return "\n\n".join(t for t in texts if t.strip()), "; ".join(notes)
 
 
-def extract(files: list[tuple[str, bytes]], settings=None) -> list[Attached]:
-    """Текст каждого файла (и файлов внутри писем) с ограничением объёма."""
+def _known_letters_view(name: str, data: bytes, conn, settings) -> str | None:
+    """Письмо глазами агента с учётом базы: сводка известной ветки, новые письма целиком, известные — строкой.
+    None — сверить не удалось (тогда — вся цепочка, как раньше)."""
+    from copilot1c.ingest.attachments import parse_bytes
+    from copilot1c.ingest.msg import ParsedEmail
+    from copilot1c.letters import LetterStore, agent_view
+
+    try:
+        st = LetterStore(conn, getattr(settings, "project", ""))
+        res = [r for p in parse_bytes(data, name, name, settings=settings) if isinstance(p, ParsedEmail)
+               for r in st.check(p)]
+        conn.rollback()
+    except Exception as exc:  # noqa: BLE001 — база недоступна: письмо целиком
+        conn.rollback()
+        log.warning("письмо %s не сверено с ветками: %s: %s", name, type(exc).__name__, exc)
+        return None
+    if not res or all(len(r.new_letters) == len(r.letters) and not r.summary_text for r in res):
+        return None  # ничего не известно — полный текст цепочки нагляднее
+    return agent_view(res)
+
+
+def extract(files: list[tuple[str, bytes]], settings=None, conn=None) -> list[Attached]:
+    """Текст каждого файла (и файлов внутри писем) с ограничением объёма. conn — подключение к базе: письма
+    сверяются с известными ветками, и агент получает сводку ветки и только новые письма, а не весь хвост."""
+    import hashlib
+
     out: list[Attached] = []
     queue = [(n, d, None) for n, d in files[:MAX_FILES]]
+    top = {hashlib.sha256(d).hexdigest(): n for n, d in files[:MAX_FILES]}
     while queue:
         name, data, parent = queue.pop(0)
         shown = f"{name} (из письма «{parent}»)" if parent else name
+        same = top.get(hashlib.sha256(data).hexdigest()) if parent else None
+        if same:  # вложение письма приложено и отдельно — второй раз не разбираем и не тратим лимит
+            out.append(Attached(shown, "skipped", note=f"то же, что приложенный файл «{same}»"))
+            continue
         try:
             if is_email_file(name):
                 text, inner, subject = _email_text(name, data)
-                a = Attached(shown, "email", text, inner=[n for n, _ in inner], subject=subject)
+                view = _known_letters_view(name, data, conn, settings) if conn is not None else None
+                a = Attached(shown, "email", view or text, inner=[n for n, _ in inner], subject=subject,
+                             note="известные письма ветки — сводкой" if view else "")
                 queue[0:0] = [(n, d, name) for n, d in inner]  # вложения письма — сразу за ним
             else:
                 text, note = _document_text(name, data, settings)

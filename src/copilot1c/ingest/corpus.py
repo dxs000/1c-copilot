@@ -56,6 +56,7 @@ class Corpus:
     ocr_images_in_docs: bool = True
 
     messages: list[EmailMessage] = field(default_factory=list)
+    emails: list[ParsedEmail] = field(default_factory=list)  # письма-файлы целиком — для letters.LetterStore
     documents: list[ParsedDocument] = field(default_factory=list)
     images: list[ImageText] = field(default_factory=list)
     skipped: list[Skipped] = field(default_factory=list)
@@ -95,6 +96,7 @@ class Corpus:
                 self.skipped.append(r)
 
     def _add_email(self, e: ParsedEmail) -> None:
+        self.emails.append(e)
         for part in walk(e):
             for m in part.messages:
                 self._add_message(m)
@@ -158,9 +160,11 @@ class Corpus:
 
     # --- выход ---
 
-    def chunks(self) -> list[Chunk]:
+    def chunks(self, messages: bool = True) -> list[Chunk]:
+        """messages=False — без писем: их фрагменты даёт letters.LetterStore (только новые письма веток)."""
         out: list[Chunk] = []
-        for m in sorted(self.messages, key=lambda x: (x.date is None, x.date and x.date.timestamp() or 0)):
+        for m in sorted(self.messages if messages else [], key=lambda x: (x.date is None,
+                                                                         x.date and x.date.timestamp() or 0)):
             out.append(message_chunk(m, self.project))
         for d in self.documents:
             out += document_chunks(d, self.project)

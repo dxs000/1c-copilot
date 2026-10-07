@@ -23,6 +23,9 @@
   DELETE /materials/{id} — убрать фрагменты материала из базы поиска (файл и запись реестра остаются,
                статус «удалён»; повторная загрузка того же файла ставит его в очередь заново).
   GET /contours, POST /contours, PATCH /contours/{id} — справочник контуров (система / процесс / проект).
+  POST /letters/check (multipart files) — письма: что уже известно, что ново, к какой ветке (ничего не пишет);
+  GET /threads?q=, GET /threads/{id} — ветки переписки и их письма; PATCH /threads/{id} — название, обращение,
+               контуры; POST /threads/{id}/summary — пересобрать сводку ветки (letters.py).
   Обращения (issues.py) — проблемы, которые заводят аналитики:
   GET   /issues/meta — справочники (статусы, категории, приоритеты) и список аналитиков;
   GET   /issues — список с фильтрами (status, priority, category, assignee, open, q);
@@ -134,6 +137,13 @@ class ContourPatch(BaseModel):
     aliases: list[str] | None = None
     notes: str | None = Field(default=None, max_length=4000)
     active: bool | None = None
+
+
+class ThreadPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(default=None, max_length=500)
+    issue_id: int | None = None
+    contours: list[int] | None = None
 
 
 class ClassifyRequest(BaseModel):
@@ -412,7 +422,14 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             data = f.file.read(MAX_UPLOAD_BYTES + 1)
             if data and len(data) <= MAX_UPLOAD_BYTES:
                 raw.append((f.filename or "файл", data))
-        items = extract(raw, s)
+        from copilot1c.graph.store import try_connect
+
+        g = try_connect(s)
+        try:
+            items = extract(raw, s, conn=g.conn if g is not None else None)
+        finally:
+            if g is not None:
+                g.close()
         attached = context_block(items)
         emails = [it for it in items if it.kind == "email"]
         # тип сообщения — по вопросу и тексту писем (проблему обычно описывает письмо, а не вопрос)
@@ -597,6 +614,106 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
             return ContourRegistry(g.conn, s.project).update(contour_id, req.model_dump(exclude_unset=True))
         except ContourError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
+        finally:
+            g.close()
+
+    # ---------- письма и ветки ----------
+
+    def _thread_out(t: dict[str, Any]) -> dict[str, Any]:
+        def iso(v):
+            return v.isoformat(timespec="minutes") if hasattr(v, "isoformat") else v
+
+        out = {k: iso(v) for k, v in t.items() if k != "letters"}
+        if "letters" in t:
+            out["letters"] = [{k: iso(v) for k, v in x.items()} for x in t["letters"]]
+        return out
+
+    @app.post("/letters/check")
+    def letters_check(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+        """Пробный прогон писем: что в них уже известно, что ново, к какой ветке относятся. Ничего не пишет."""
+        from copilot1c.email_intake import is_email_file
+        from copilot1c.ingest.attachments import parse_bytes
+        from copilot1c.ingest.msg import ParsedEmail
+        from copilot1c.letters import LetterStore, agent_view
+        from copilot1c.materials import MAX_UPLOAD_BYTES
+
+        g, _ = _registry(s)
+        try:
+            st = LetterStore(g.conn, s.project)
+            out = []
+            for f in files:
+                name = f.filename or "письмо"
+                data = f.file.read(MAX_UPLOAD_BYTES + 1)
+                if not is_email_file(name) or len(data) > MAX_UPLOAD_BYTES:
+                    out.append({"filename": name, "error": "не письмо .msg/.eml или файл слишком большой"})
+                    continue
+                parsed = [x for x in parse_bytes(data, name, name, settings=s) if isinstance(x, ParsedEmail)]
+                res = [r for p in parsed for r in st.check(p)]
+                out.append({"filename": name, "chains": [r.out() for r in res], "agent_view": agent_view(res)})
+            g.conn.rollback()
+            return {"files": out}
+        finally:
+            g.close()
+
+    @app.get("/threads")
+    def threads_list(q: str | None = None, limit: int = 100) -> dict[str, Any]:
+        from copilot1c.letters import LetterStore
+
+        g, _ = _registry(s)
+        try:
+            rows = LetterStore(g.conn, s.project).list(q or None, min(max(limit, 1), 500))
+            g.conn.commit()
+            return {"threads": [_thread_out(r) for r in rows]}
+        finally:
+            g.close()
+
+    @app.get("/threads/{thread_id}")
+    def thread_get(thread_id: int) -> dict[str, Any]:
+        from copilot1c.letters import LetterStore
+
+        g, _ = _registry(s)
+        try:
+            t = LetterStore(g.conn, s.project).thread(thread_id)
+            g.conn.commit()
+        finally:
+            g.close()
+        if t is None:
+            raise HTTPException(404, "Ветка не найдена")
+        return _thread_out(t)
+
+    @app.patch("/threads/{thread_id}")
+    def thread_patch(thread_id: int, req: ThreadPatch) -> dict[str, Any]:
+        from copilot1c.letters import LetterStore
+
+        g, _ = _registry(s)
+        try:
+            st = LetterStore(g.conn, s.project)
+            if st.thread(thread_id) is None:
+                raise HTTPException(404, "Ветка не найдена")
+            data = req.model_dump(exclude_unset=True)
+            if data.get("issue_id") is not None and not st._rows("SELECT 1 FROM issues WHERE id = %s AND project = %s",
+                                                                 (data["issue_id"], s.project)):
+                raise HTTPException(422, "Обращение не найдено")
+            t = st.update(thread_id, data)
+            g.conn.commit()
+            return _thread_out(t)
+        finally:
+            g.close()
+
+    @app.post("/threads/{thread_id}/summary")
+    def thread_summary(thread_id: int) -> dict[str, Any]:
+        """Пересобрать сводку ветки (модель или шаблон) и её фрагмент в базе поиска."""
+        from copilot1c.letters import LetterStore, summarize
+        from copilot1c.search import PgIndex
+
+        g, _ = _registry(s)
+        try:
+            st = LetterStore(g.conn, s.project)
+            if st.thread(thread_id) is None:
+                raise HTTPException(404, "Ветка не найдена")
+            res = summarize(st, thread_id, s, use_llm=s.thread_summary_llm, index=PgIndex(g.conn, s))
+            g.conn.commit()
+            return res
         finally:
             g.close()
 

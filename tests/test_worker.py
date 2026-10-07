@@ -14,6 +14,7 @@ from fixtures.synthetic import make_eml, make_pimi, make_tz
 from copilot1c import server, worker
 from copilot1c.config import Settings
 from copilot1c.ingest.corpus import Corpus
+from copilot1c.letters import ingest_emails
 from copilot1c.search import PgIndex
 
 PG_DSN = os.environ.get("COPILOT_TEST_PG_DSN")
@@ -43,16 +44,18 @@ def env(tmp_path, monkeypatch):
     make_eml(data / "mails" / "RE Обновление.eml")
     make_tz(data / "ТЗ ред2.docx")
     s = Settings(pg_dsn=PG_DSN, project="test-proj", ocr_backend="none", cache_dir="", yc_api_key="k",
-                 yc_folder_id="f", onec_bin="/nonexistent")
+                 yc_folder_id="f", onec_bin="/nonexistent", thread_summary_llm=False)
     g = GraphStore(settings=s)
     g.init_schema()
-    for t in ("mentions", "relations", "materials", "chunks", "test_cases", "requirements", "requirement_tests"):
+    for t in ("mentions", "relations", "letters", "threads", "materials", "chunks", "test_cases", "requirements",
+              "requirement_tests"):
         g.conn.execute(f"DELETE FROM {t}")
     g.conn.commit()
     # База как после «index-docs data»: все основные материалы уже записаны
-    base = Corpus(project=s.project, settings=s).add_paths([data]).chunks()
+    corpus = Corpus(project=s.project, settings=s).add_paths([data])
     index = FakeIndex(g.conn, s)
-    index.add(base)
+    index.add(corpus.chunks(messages=False))
+    ingest_emails(g.conn, s, corpus.emails, index)  # письма — через ветки, как index-docs
     index.uploaded = []
     yield s, g, index, tmp_path
     g.close()
@@ -174,3 +177,29 @@ def test_indexing_detail_is_per_file(env, tmp_path):
     _run(s, g, spy)
     assert seen["ПиМИ.docx"].startswith("записываю в базу поиска новые фрагменты: ")
     assert seen["копия.eml"].startswith("новых фрагментов в файле нет")
+
+
+def test_reply_adds_only_new_letter_to_known_thread(env):
+    """Ответ с хвостом всей переписки: в базу идёт одно новое письмо, остальное узнано в ветке."""
+    from email.message import EmailMessage as Mime
+
+    from fixtures.synthetic import THREAD_BODY
+
+    s, g, index, root = env
+    reply = Mime()
+    reply["Subject"] = "RE: Обновление конфигурации 1С УТ11 до версии 11.5.27.75"
+    reply["From"] = "Smith John <john.smith@customer.com>"
+    reply["Date"] = "Thu, 24 Sep 2026 09:15:00 +0200"
+    reply["Message-ID"] = "<smith-0924@customer.com>"
+    reply.set_content("Hello, ДС №10 согласовано, подписанный экземпляр направим до конца недели.\n\nBest regards\n"
+                      "John\n\nFrom: Петрова Анна\nSent: Wednesday, September 23, 2026 7:02 PM\n"
+                      "To: Smith John <john.smith@customer.com>\n"
+                      "Subject: RE: Обновление конфигурации 1С УТ11 до версии 11.5.27.75\n\n" + THREAD_BODY)
+    c, _ = _upload(s, [("RE RE Обновление.eml", bytes(reply))])
+    _run(s, g, index)
+    m = c.get("/materials").json()["materials"][0]
+    assert m["status"] == "done", m
+    assert m["report"]["letters_new"] == 1 and m["report"]["letters_known"] >= 2
+    assert "новых писем 1" in m["detail"] and len(m["report"]["threads"]) == 1
+    rows = g.query("SELECT text FROM chunks WHERE material_id = %s AND attrs->>'kind' IS NULL", (m["id"],))
+    assert len(rows) == 1 and "согласовано" in rows[0]["text"]

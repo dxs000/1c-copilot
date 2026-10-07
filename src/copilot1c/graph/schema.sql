@@ -284,3 +284,50 @@ CREATE TABLE IF NOT EXISTS issue_events (
     comment    text
 );
 CREATE INDEX IF NOT EXISTS issue_events_issue_idx ON issue_events (issue_id, id);
+
+-- ===== Письма и ветки переписки =====
+-- Единица хранения — отдельное письмо, а не файл: файл с ответом несёт в цитатах всю ветку, и уже известные
+-- письма не индексируются повторно. Ветка связывает письма одного обсуждения независимо от смены темы
+-- (по пересечению с известными письмами); у неё сводка состояния, которая пересобирается при новых письмах.
+CREATE TABLE IF NOT EXISTS threads (
+    id               bigserial PRIMARY KEY,
+    project          text NOT NULL,
+    subject          text NOT NULL,              -- тема первого письма без RE/FW
+    title            text,                       -- название ветки, если аналитик переименовал
+    contours         bigint[] NOT NULL DEFAULT '{}',
+    issue_id         bigint REFERENCES issues(id) ON DELETE SET NULL,
+    summary          jsonb,                      -- {problem, done[], waiting, status, open_questions[]}
+    summary_text     text,
+    summary_letters  int NOT NULL DEFAULT 0,     -- сколько писем было, когда собиралась сводка
+    summary_at       timestamptz,
+    summary_chunk    text,                       -- фрагмент базы поиска со сводкой
+    first_at         timestamptz,
+    last_at          timestamptz,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS threads_project_idx ON threads (project, last_at DESC);
+
+CREATE TABLE IF NOT EXISTS letters (
+    id            bigserial PRIMARY KEY,
+    project       text NOT NULL,
+    thread_id     bigint NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    parent_id     bigint REFERENCES letters(id) ON DELETE SET NULL,   -- на какое письмо это ответ
+    message_id    text,                          -- только у писем, пришедших файлом
+    sender        text,
+    sender_email  text,
+    sender_key    text NOT NULL,                 -- фамилия или имя ящика: одинаковы в письме и в цитате
+    recipients    text,
+    sent_at       timestamptz,
+    subject       text,
+    body          text NOT NULL,                 -- очищенный текст без цитат
+    inline_notes  text,                          -- ответы, вписанные этим письмом внутрь цитаты
+    origin        text NOT NULL,                 -- file | quoted (известно только по цитате)
+    source        text,
+    material_id   bigint REFERENCES materials(id) ON DELETE SET NULL,
+    chunk_id      text,
+    first_seen    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS letters_message_idx ON letters (project, message_id) WHERE message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS letters_sender_idx ON letters (project, sender_key, sent_at);
+CREATE INDEX IF NOT EXISTS letters_thread_idx ON letters (thread_id, sent_at);

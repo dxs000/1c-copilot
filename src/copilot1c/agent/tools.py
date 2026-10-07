@@ -53,8 +53,13 @@ prepare_escalation: укажи, почему не справился, и сфо�
 аналитик. Всё равно дай в ответе то, что удалось выяснить, и прямо скажи, чего не хватает.
 
 Приложенные файлы. Если в сообщении есть блок «Приложено к вопросу» — это материалы, которые аналитик
-приложил сейчас (письма, документы, скриншоты); их нет в базе проекта. Используй их как главный
-контекст вопроса и ссылайся на них как «приложенный файл «имя»»; факты из базы проекта — как обычно.
+приложил сейчас (письма, документы, скриншоты). Используй их как главный контекст вопроса и ссылайся на
+них как «приложенный файл «имя»»; факты из базы проекта — как обычно.
+
+Переписка. Письма хранятся ветками: каждое письмо в базе один раз, у ветки есть сводка состояния. Если у
+приложенного письма часть писем «уже известна», тебе показаны сводка ветки и только новые письма — новое
+и есть обновление по вопросу: скажи, что в нём изменилось относительно сводки. Нужна вся история —
+get_thread. Свежие письма важнее старых; при расхождении опирайся на более позднее и назови расхождение.
 
 Предметная область. Объекты с префиксом КС_ или суффиксом (КС) — доработки интегратора.
 Сгенерированный код перед выдачей проверяй инструментом build_and_check."""
@@ -88,6 +93,9 @@ TOOLS = [
     _fn("search_issues", "Поиск среди зарегистрированных обращений: по смыслу, тексту ошибки 1С, объектам, теме, "
         "инициатору. Для проверки дублей и поиска решённых похожих проблем.",
         {"query": _STR, "open_only": {"type": "boolean", "description": "Только незакрытые"}}, ["query"]),
+    _fn("get_thread", "Ветка переписки целиком: сводка состояния, участники, письма по порядку (новые — полностью). "
+        "Номер ветки — в атрибуте thread найденного письма; можно искать и по словам темы.",
+        {"thread": {"type": "string", "description": "Номер ветки или слова из темы"}}, ["thread"]),
     _fn("web_search", "Поиск в интернете (Yandex). Только когда в базе проекта ответа нет и вопрос про платформу, "
         "типовую конфигурацию, ошибку, версии. Запрос — без имён, контактов, серверов и названия заказчика.",
         {"query": {"type": "string", "description": "Текст ошибки, объекты 1С, версии, общие слова"},
@@ -223,6 +231,26 @@ def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
         assert ctx.store, "PostgreSQL недоступен"
         return find(ctx.store.conn, project, query, open_only) or {"result": "похожих обращений нет"}
 
+    def get_thread(thread: str):
+        from copilot1c.letters import LetterStore
+
+        assert ctx.store, "PostgreSQL недоступен"
+        t = LetterStore(ctx.store.conn, project).find_thread(str(thread))
+        ctx.store.conn.rollback()
+        if t is None:
+            return {"result": "ветка не найдена"}
+        letters, budget = [], 20000
+        for x in reversed(t["letters"]):  # свежие письма важнее: бюджет текста — с конца ветки
+            text = (x["body"] + (f"\n{x['inline_notes']}" if x.get("inline_notes") else "")).strip()
+            take = text[:max(min(budget, 3000), 300)]
+            budget -= len(take)
+            letters.append({"от": x.get("sender"), "дата": f"{x['sent_at']:%d.%m.%Y %H:%M}" if x.get("sent_at") else "",
+                            "тема": x.get("subject"), "текст": take + ("…" if len(take) < len(text) else ""),
+                            "известно_только_по_цитате": x.get("origin") == "quoted"})
+        return {"ветка": t["id"], "тема": t.get("title") or t["subject"], "обращение": t.get("issue_id"),
+                "сводка": t.get("summary_text"), "писем": len(t["letters"]), "письма": list(reversed(letters)),
+                "источник": f"ветка переписки «{t.get('title') or t['subject']}» № {t['id']}"}
+
     def prepare_escalation(reason: str, expert_question: str):
         ctx.escalation = {"reason": (reason or "").strip()[:2000], "expert_question": (expert_question or "").strip()[:4000]}
         return {"ok": True, "note": "Аналитику будет предложено собрать пакет для эксперта. Дай в ответе то, что "
@@ -234,7 +262,7 @@ def make_handlers(ctx: ToolContext) -> dict[str, Callable[..., Any]]:
         return [{"step": r.argv[r.argv.index("/Out") + 2], "ok": r.ok, "log": r.log[-4000:]} for r in results]
 
     return {f.__name__: f for f in (search_docs, search_code, graph_query, get_module, diff_versions, sql,
-                                     get_issue, search_issues, web_search, read_page, prepare_escalation,
+                                     get_issue, search_issues, get_thread, web_search, read_page, prepare_escalation,
                                      build_and_check)}
 
 
@@ -251,7 +279,7 @@ class AgentResult:
 def available_tools(ctx: ToolContext) -> list[dict]:
     unavailable: set[str] = set()
     if ctx.store is None:  # без PostgreSQL инструменты графа, реестров и обращений не предлагаются вовсе
-        unavailable |= {"graph_query", "sql", "get_issue", "search_issues"}
+        unavailable |= {"graph_query", "sql", "get_issue", "search_issues", "get_thread"}
     s = ctx.settings
     if not (getattr(s, "web_search", False) and s.yc_api_key and s.yc_folder_id):  # интернет выключен или нет ключа
         unavailable |= {"web_search", "read_page"}

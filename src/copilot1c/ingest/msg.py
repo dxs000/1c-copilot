@@ -39,6 +39,7 @@ class EmailMessage:
     source: str
     origin: str = "file"  # file | quoted
     attachments: list[str] = field(default_factory=list)  # имена вложений (для заголовка чанка)
+    message_id: str | None = None  # Message-ID — только у писем-файлов, у цитат его нет
 
     @property
     def thread_id(self) -> str:
@@ -84,12 +85,13 @@ def thread_id(subject: str) -> str:
 
 
 def _build(subject: str, sender_raw: str, to: str, cc: str, date: datetime | None, raw_body: str, source: str,
-           attachment_names: list[str]) -> list[EmailMessage]:
+           attachment_names: list[str], message_id: str | None = None) -> list[EmailMessage]:
     tz = date.tzinfo if date else None
     own, quoted = split_thread(raw_body, tz)
     name, addr = split_address(sender_raw)
     msgs = [EmailMessage(subject=subject, sender=name, sender_email=addr, to=to, cc=cc, date=date,
-                         body=clean_email_text(own), source=source, attachments=attachment_names)]
+                         body=clean_email_text(own), source=source, attachments=attachment_names,
+                         message_id=(message_id or "").strip().replace("\x00", "") or None)]
     for i, q in enumerate(quoted, 1):
         msgs.append(EmailMessage(
             subject=q.subject or subject, sender=q.sender, sender_email=q.sender_email, to=q.to, cc=q.cc,
@@ -115,7 +117,7 @@ def _parse_mapi(msg: MessageBase, source: str) -> ParsedEmail:
     date = msg.date if isinstance(msg.date, datetime) else None
     names = [a.filename for a in attachments if not a.inline] + [n.message.subject or "письмо" for n in nested]
     messages = _build(msg.subject or "", msg.sender or "", msg.to or "", msg.cc or "", date, msg.body or "",
-                      source, names)
+                      source, names, getattr(msg, "messageId", None))
     return ParsedEmail(messages=messages, attachments=attachments, nested=nested, source=source)
 
 
@@ -163,7 +165,7 @@ def _parse_eml_message(m: email.message.EmailMessage, source: str) -> ParsedEmai
         date = None
     names = [a.filename for a in attachments if not a.inline] + [n.message.subject for n in nested]
     messages = _build(str(m["Subject"] or ""), str(m["From"] or ""), str(m["To"] or ""), str(m["Cc"] or ""),
-                      date, _eml_body(m), source, names)
+                      date, _eml_body(m), source, names, str(m["Message-ID"] or ""))
     return ParsedEmail(messages=messages, attachments=attachments, nested=nested, source=source)
 
 
