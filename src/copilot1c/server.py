@@ -56,7 +56,10 @@
   POST /secretary/say {person, text} — фраза («я в Варшаве», «работаем час», «стоп»…) → ответ, действия, состояние;
   GET  /secretary/state?person= — место, местное время, идущая сессия, планы, непрочитанные сообщения таймера;
   GET  /secretary/notices?person=&after= — сообщения таймера; POST /secretary/notices/{id}/read {person};
-  GET  /secretary/places?person= — журнал мест. Таймер — поток демона (secretary/timer.py), запускается с serve.
+  GET  /secretary/places?person= — журнал мест.
+  GET  /secretary/books?person= — книги с прогрессом (страница, %, за 7 дней, последнее чтение);
+  GET  /secretary/books/{id}?person= — история чтения книги (дата и время по месту, страница, прирост).
+  Таймер — поток демона (secretary/timer.py), запускается с serve.
 """
 
 from __future__ import annotations
@@ -1255,6 +1258,25 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         g, sec = _secretary()
         try:
             return {"places": [_place_out(p) for p in sec.store.history(person.strip(), min(max(limit, 1), 500))]}
+        finally:
+            g.close()
+
+    @app.get("/secretary/books")
+    def secretary_books(person: str = "") -> dict[str, Any]:
+        g, sec = _secretary()
+        try:
+            return {"books": sec.books_table(person.strip())}
+        finally:
+            g.close()
+
+    @app.get("/secretary/books/{book_id}")
+    def secretary_book(book_id: int, person: str = "") -> dict[str, Any]:
+        g, sec = _secretary()
+        try:
+            res = sec.book_history(person.strip(), book_id)
+            if res is None:
+                raise HTTPException(404, "Книга не найдена")
+            return res
         finally:
             g.close()
 

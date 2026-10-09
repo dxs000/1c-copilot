@@ -122,6 +122,44 @@ def test_unknown_city_goes_to_model_and_bad_tz_rejected(monkeypatch):
         resolve("Атлантиде", s, Cache)
 
 
+def test_pick_tz_accepts_what_model_really_says():
+    from copilot1c.secretary.places import pick_tz
+
+    assert pick_tz("Europe/Moscow") == "Europe/Moscow" and pick_tz("europe/moscow") == "Europe/Moscow"
+    assert pick_tz("MSK") == "Europe/Moscow" and pick_tz("МСК", "RU") == "Europe/Moscow"
+    assert pick_tz("МСК+2") == "Asia/Yekaterinburg" and pick_tz("MSK-1") == "Europe/Kaliningrad"
+    assert pick_tz("UTC+3", "RU") == "Europe/Moscow" and pick_tz("Москва", "RU", "+03:00") == "Europe/Moscow"
+    assert pick_tz("", "RU", "+07:00") in ("Asia/Novosibirsk", "Asia/Barnaul", "Asia/Tomsk", "Asia/Krasnoyarsk",
+                                            "Asia/Novokuznetsk")
+    assert pick_tz("", "EG", "") == "Africa/Cairo"  # в стране один пояс
+    assert pick_tz("GMT+5") == "Etc/GMT-5"  # без страны — по смещению (у Etc/GMT знак обратный)
+    assert pick_tz("непонятно") is None
+
+
+def test_russian_cities_from_directory():
+    s = Settings(yc_api_key="", yc_folder_id="")
+    for said, city, tz in [("Брянске", "Брянск", "Europe/Moscow"), ("Воронеже", "Воронеж", "Europe/Moscow"),
+                           ("Твери", "Тверь", "Europe/Moscow"), ("Самаре", "Самара", "Europe/Samara"),
+                           ("Ростове-на-Дону", "Ростов-на-Дону", "Europe/Moscow"), ("Каире", "Каир", "Africa/Cairo"),
+                           ("Владивостоке", "Владивосток", "Asia/Vladivostok")]:
+        p = resolve(said, s)
+        assert (p.city, p.tz) == (city, tz), said
+
+
+def test_model_msk_answer_is_accepted(monkeypatch):
+    from copilot1c.index import yandex
+
+    s = Settings(yc_api_key="k", yc_folder_id="f")
+    monkeypatch.setattr(yandex, "chat_json", lambda *a, **kw: {
+        "is_place": True, "city": "Новозыбков", "country": "Россия", "country_code": "RU", "timezone": "MSK",
+        "utc_offset": "UTC+3"})
+    assert resolve("Новозыбкове", s).tz == "Europe/Moscow"
+    monkeypatch.setattr(yandex, "chat_json", lambda *a, **kw: {"is_place": True, "city": "Икс", "country": "",
+                                                                 "timezone": "где-то"})
+    with pytest.raises(NotAPlace, match="модель ответила «где-то»"):
+        resolve("Иксе", s)
+
+
 # ---------- погода ----------
 
 def test_weather_from_yandex_search(monkeypatch):
@@ -180,7 +218,7 @@ def sec():
     clock = Clock(datetime(2026, 10, 9, 5, 0, tzinfo=UTC))  # 07:00 в Варшаве (UTC+2)
     weather_calls = []
     sx = Secretary(g.conn, s, now=clock, weather=lambda c, k: weather_calls.append(c) or WEATHER)
-    for t in ("sec_notices", "sec_sessions", "sec_places", "sec_place_names"):
+    for t in ("sec_notices", "sec_sessions", "sec_places", "sec_place_names", "sec_reading", "sec_books"):
         g.conn.execute(f"DELETE FROM {t}")
     g.conn.commit()
     sx.clock, sx.weather_calls = clock, weather_calls
@@ -308,3 +346,95 @@ def test_api(monkeypatch):
     assert c.get("/secretary/notices", params={"person": "Иван"}).json() == {"notices": []}
     assert c.post("/secretary/notices/999999/read", json={"person": "Иван"}).status_code == 404
     assert c.post("/secretary/say", json={"person": "Иван", "text": ""}).status_code == 422
+
+
+# ---------- книги ----------
+
+def test_book_phrases():
+    c = _one('Зарегистрировать для чтения книгу Л.Н.Толстой "Война и Мир"')
+    assert (c.action, c.author, c.title) == ("book_add", "Л.Н. Толстой", "Война и Мир")
+    c = _one("Зарегистрируй книгу Ф.М.Достоевский «Идиот», 640 страниц")
+    assert (c.author, c.title, c.total_pages) == ("Ф.М. Достоевский", "Идиот", 640)
+    c = _one("новая книга: Булгаков — Мастер и Маргарита")
+    assert (c.author, c.title) == ("Булгаков", "Мастер и Маргарита")
+    for text, no, page in [("Читаю книгу номер 1 текущая страница 70", 1, 70), ("книга № 2, стр. 154", 2, 154),
+                           ("книга 1 стр 70", 1, 70), ("прочитал до 120 страницы в книге 2", 2, 120),
+                           ("№1 с.75", 1, 75), ("прочитал 120-ю страницу книги 3", 3, 120), ("страница 90", None, 90),
+                           ("вернулся к книге 2, страница 160", 2, 160)]:
+        c = _one(text)
+        assert (c.action, c.book_no, c.page) == ("book_page", no, page), text
+    c = _one("Война и мир — страница 85")
+    assert (c.action, c.book_ref, c.page) == ("book_page", "Война и мир", 85)
+    assert (_one("в книге 1 всего 1300 страниц").action, _one("в книге 2 640 страниц").total_pages) == ("book_total", 640)
+    assert _one("дочитал книгу 1").action == "book_done" and _one("закончил книгу № 2").action == "book_done"
+    assert _one("отложил книгу 2").action == "book_pause" and _one("удали книгу 3").action == "book_delete"
+    assert _one("мои книги").action == "books" and _one("что читаю").action == "books"
+    assert _one("стоп").action == "stop" and _one("я в Варшаве").action == "place"  # прежние фразы не задеты
+
+
+@needs_pg
+def test_books_journey(sec):
+    sec.say("ivan", "я в Москве")
+    r = sec.say("ivan", 'Зарегистрировать для чтения книгу Л.Н.Толстой "Война и Мир"')
+    assert r["reply"].startswith("Зарегистрировал книгу № 1 — Л.Н. Толстой «Война и Мир»")
+    assert "Уже есть: книга № 1" in sec.say("ivan", 'зарегистрируй книгу Л.Н. Толстой "Война и Мир"')["reply"]
+    r = sec.say("ivan", "Зарегистрируй книгу Ф.М.Достоевский «Идиот», 640 страниц")
+    assert "№ 2 — Ф.М. Достоевский «Идиот», 640 стр." in r["reply"]
+    assert "Какая книга?" in sec.say("ivan", "страница 90")["reply"]  # две читаемые — без номера не угадываем
+
+    r = sec.say("ivan", "Читаю книгу номер 1 текущая страница 70")
+    assert "Книга № 1 — Л.Н. Толстой «Война и Мир»: стр. 70" in r["reply"]
+    assert "записал 09.10.2026 08:00 (Москва)" in r["reply"]  # 05:00 UTC → 08:00 по Москве
+    sec.say("ivan", "в книге 1 всего 1300 страниц")
+    sec.clock.tick(days=1, hours=13)
+    r = sec.say("ivan", "Война и мир — страница 130")
+    assert "стр. 130 из 1300 (10 %)" in r["reply"] and "+60 стр. с 09.10 08:00" in r["reply"]
+    sec.say("ivan", "книга 2 стр. 50")
+    assert "меньше прежней (130" in sec.say("ivan", "книга 1, стр. 120")["reply"]
+
+    table = {b["num"]: b for b in sec.books_table("ivan")}
+    assert table[1]["page"] == 120 and table[1]["percent"] == 9 and table[1]["entries"] == 3
+    assert table[1]["week_pages"] == 120 and table[1]["last_text"] == "10.10.2026 21:00 (Москва)"
+    assert table[2]["page"] == 50 and table[2]["percent"] == 8 and table[2]["left"] == 590
+    hist = sec.book_history("ivan", table[1]["id"])
+    assert [e["page"] for e in hist["entries"]] == [120, 130, 70] and hist["entries"][0]["delta"] == -10
+    assert sec.state("ivan")["books"][0]["num"] == 1
+
+    assert "Отложил" in sec.say("ivan", "отложил книгу 2")["reply"]
+    assert sec.state("ivan")["books"] == [b for b in sec.state("ivan")["books"] if b["num"] == 1]
+    sec.say("ivan", "книга 2 стр. 60")  # отметка страницы возвращает книгу в чтение
+    assert {b["num"] for b in sec.state("ivan")["books"]} == {1, 2}
+    assert "прочитанную" in sec.say("ivan", "дочитал книгу 2")["reply"]
+    r = sec.say("ivan", "мои книги")["reply"]
+    assert "№ 1 — Л.Н. Толстой «Война и Мир» — читаю, стр. 120 из 1300 (9 %)" in r and "прочитана" in r
+    sec.say("ivan", "удали книгу 2")
+    assert [b["num"] for b in sec.books_table("ivan")] == [1]
+    r = sec.say("ivan", 'зарегистрируй книгу Чехов "Рассказы"')
+    assert "№ 3" in r["reply"]  # номер удалённой не переиспользуется
+    assert "Книги № 7 нет" in sec.say("ivan", "книга 7 стр 10")["reply"]
+    assert sec.books_table("petr") == []  # у каждого свои книги
+
+
+@needs_pg
+def test_books_api():
+    from fastapi.testclient import TestClient
+
+    from copilot1c import server
+    from copilot1c.graph.store import GraphStore
+    from copilot1c.secretary.store import ensure_schema
+
+    s = Settings(pg_dsn=PG_DSN, yc_api_key="", yc_folder_id="", secretary_llm=False, secretary_weather=False)
+    g = GraphStore(settings=s)
+    ensure_schema(g.conn)
+    g.conn.execute("DELETE FROM sec_reading")
+    g.conn.execute("DELETE FROM sec_books")
+    g.conn.commit()
+    g.close()
+    c = TestClient(server.create_app(s))
+    c.post("/secretary/say", json={"person": "Иван", "text": "зарегистрируй книгу Толстой «Война и мир»"})
+    c.post("/secretary/say", json={"person": "Иван", "text": "книга 1 страница 70"})
+    books = c.get("/secretary/books", params={"person": "Иван"}).json()["books"]
+    assert books[0]["label"] == "№ 1 — Толстой «Война и мир»" and books[0]["page"] == 70
+    h = c.get(f"/secretary/books/{books[0]['id']}", params={"person": "Иван"}).json()
+    assert h["entries"][0]["page"] == 70
+    assert c.get(f"/secretary/books/{books[0]['id']}", params={"person": "Пётр"}).status_code == 404

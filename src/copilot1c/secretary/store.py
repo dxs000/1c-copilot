@@ -144,6 +144,53 @@ class SecretaryStore:
                           (person, since))
         return {r["kind"]: max(0, r["seconds"] or 0) // 60 for r in rows}
 
+    # ---------- книги ----------
+
+    def add_book(self, person: str, author: str, title: str, total_pages: int | None, said: str,
+                 at: datetime) -> dict:
+        """Новая книга со следующим номером человека (номера удалённых не переиспользуются)."""
+        try:
+            with self.conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext('sec_books:' || %s))", (person,))
+                cur.execute("""INSERT INTO sec_books (person, num, author, title, total_pages, said, created_at)
+                               VALUES (%s, (SELECT coalesce(max(num), 0) + 1 FROM sec_books WHERE person = %s),
+                                       %s, %s, %s, %s, %s) RETURNING *""",
+                            (person, person, author, title, total_pages, said, at))
+                row = cur.fetchone()
+            self.conn.commit()
+            return row
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def books(self, person: str, include_done: bool = True) -> list[dict]:
+        statuses = ("reading", "paused", "done") if include_done else ("reading", "paused")
+        return self._rows("""SELECT * FROM sec_books WHERE person = %s AND status = ANY(%s) ORDER BY num""",
+                          (person, list(statuses)))
+
+    def book(self, person: str, num: int) -> dict | None:
+        return self._one("SELECT * FROM sec_books WHERE person = %s AND num = %s AND status <> 'deleted'",
+                         (person, num))
+
+    def book_by_id(self, person: str, book_id: int) -> dict | None:
+        return self._one("SELECT * FROM sec_books WHERE person = %s AND id = %s AND status <> 'deleted'",
+                         (person, book_id))
+
+    def update_book(self, book_id: int, **fields) -> dict:
+        cols = ", ".join(f"{k} = %s" for k in fields)
+        return self._one(f"UPDATE sec_books SET {cols} WHERE id = %s RETURNING *", (*fields.values(), book_id))
+
+    def add_reading(self, book: dict, page: int, at: datetime, city: str | None, tz: str | None, said: str) -> dict:
+        return self._one("""INSERT INTO sec_reading (book_id, person, page, at, city, tz, said)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                         (book["id"], book["person"], page, at, city, tz, said))
+
+    def reading_log(self, person: str, book_ids: list[int] | None = None) -> list[dict]:
+        if book_ids is not None:
+            return self._rows("SELECT * FROM sec_reading WHERE person = %s AND book_id = ANY(%s) ORDER BY at, id",
+                              (person, book_ids))
+        return self._rows("SELECT * FROM sec_reading WHERE person = %s ORDER BY at, id", (person,))
+
     # ---------- сообщения ----------
 
     def notices(self, person: str, after_id: int = 0, unread: bool = False, limit: int = 50) -> list[dict]:

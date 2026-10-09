@@ -194,6 +194,13 @@ class Command:
     until: time | None = None
     direction: str | None = None      # arrive | depart
     notes: list[str] = field(default_factory=list)
+    # книги (secretary/books.py)
+    book_no: int | None = None        # № книги у человека
+    book_ref: str | None = None       # книга названием, если номера нет
+    page: int | None = None
+    author: str | None = None
+    title: str | None = None
+    total_pages: int | None = None
 
 
 def _place_after(text: str, start: int) -> str | None:
@@ -252,6 +259,11 @@ def parse(text: str, today: date) -> list[Command]:
         return []
     if _HELP.search(t):
         return [Command("help")]
+    from copilot1c.secretary.books import parse_book
+
+    book = parse_book(t)  # раньше остальных: «закончил книгу» — не «стоп», «вернулся к книге» — не переезд
+    if book is not None:
+        return [book]
     if _HISTORY.search(t):
         return [Command("history")]
     if _CANCEL_TRIP.search(t):

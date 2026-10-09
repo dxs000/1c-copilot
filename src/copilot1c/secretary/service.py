@@ -12,6 +12,7 @@ from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from copilot1c.secretary.books import book_label, stats
 from copilot1c.secretary.parse import Command, parse
 from copilot1c.secretary.places import NotAPlace, resolve
 from copilot1c.secretary.store import SecretaryStore
@@ -26,6 +27,8 @@ HELP = ("Я веду ваш распорядок.\n"
         "«где я был».\n"
         "• Сессии: «работаем час», «работаю до 18:00», «перерыв 15 минут», «сколько осталось», «стоп».\n"
         "• «Где я» — место, местное время и погода сейчас.\n"
+        "• Книги: «зарегистрируй книгу Л.Н. Толстой „Война и мир“», «читаю книгу № 1, страница 70», «в книге 1 "
+        "всего 1300 страниц», «дочитал книгу 1», «отложил книгу 2», «мои книги». Таблица — на странице «Книги».\n"
         "По окончании сессии напишу точное местное время и погоду там, где вы находитесь.")
 
 
@@ -281,6 +284,139 @@ class Secretary:
                 f"Местное время: {fmt_local(local)}.\n{weather_line(w)}" + self._plans_hint(person, now),
                 {"action": "where", "weather": w})
 
+    # ---------- книги ----------
+
+    def _find_book(self, person: str, cmd: Command) -> tuple[dict | None, str]:
+        """Книга по номеру, названию или единственная читаемая. (книга, пояснение, если не нашлась)."""
+        if cmd.book_no is not None:
+            b = self.store.book(person, cmd.book_no)
+            return (b, "") if b else (None, f"Книги № {cmd.book_no} нет. {self._books_short(person)}")
+        active = self.store.books(person, include_done=False)
+        if cmd.book_ref:
+            ref = cmd.book_ref.lower().replace("ё", "е")
+            found = [b for b in self.store.books(person) if ref[:6] in b["title"].lower().replace("ё", "е")
+                     or b["title"].lower().replace("ё", "е")[:6] in ref]
+            if len(found) == 1:
+                return found[0], ""
+        reading = [b for b in active if b["status"] == "reading"] or active
+        if cmd.book_no is None and not cmd.book_ref and len(reading) == 1:
+            return reading[0], ""
+        if not active:
+            return None, "Книг пока нет. Зарегистрируйте: «зарегистрируй книгу Л.Н. Толстой „Война и мир“»."
+        return None, f"Какая книга? {self._books_short(person)} Например: «книга № 1, страница 70»."
+
+    def _books_short(self, person: str) -> str:
+        bs = self.store.books(person, include_done=False)
+        return ("Сейчас: " + "; ".join(f"№ {b['num']} «{b['title']}»" for b in bs) + ".") if bs else ""
+
+    def _do_book_add(self, person, cmd, said):
+        same = [b for b in self.store.books(person) if b["title"].lower() == (cmd.title or "").lower()
+                and (b["author"] or "").lower() == (cmd.author or "").lower()]
+        if same:
+            return f"Уже есть: книга {book_label(same[0])}.", {"action": "book_add", "ok": False,
+                                                                "book": _book_out(same[0])}
+        b = self.store.add_book(person, cmd.author or "", cmd.title or "", cmd.total_pages, said, self.now())
+        pages = f", {b['total_pages']} стр." if b["total_pages"] else ""
+        return (f"Зарегистрировал книгу {book_label(b)}{pages}. Отмечайте: «книга № {b['num']}, страница 70».",
+                {"action": "book_add", "ok": True, "book": _book_out(b)})
+
+    def _do_book_page(self, person, cmd, said):
+        b, why = self._find_book(person, cmd)
+        if b is None:
+            return why, {"action": "book_page", "ok": False}
+        now = self.now()
+        local, place = self.local(person, now)
+        log = self.store.reading_log(person, [b["id"]])
+        prev = log[-1] if log else None
+        self.store.add_reading(b, cmd.page, now, place["city"] if place else None,
+                               place["tz"] if place else str(local.tzinfo), said)
+        if b["status"] != "reading":
+            b = self.store.update_book(b["id"], status="reading", finished_at=None)
+        parts = [f"Книга {book_label(b)}: стр. {cmd.page}"]
+        if b["total_pages"]:
+            parts[0] += f" из {b['total_pages']} ({round(min(cmd.page / b['total_pages'], 1) * 100)} %)"
+        if prev:
+            delta = cmd.page - prev["page"]
+            when = prev["at"].astimezone(ZoneInfo(prev["tz"]) if _valid(prev.get("tz")) else local.tzinfo)
+            if delta >= 0:
+                parts.append(f"+{delta} стр. с {when.strftime('%d.%m %H:%M')}")
+            else:
+                parts.append(f"меньше прежней ({prev['page']}, {when.strftime('%d.%m %H:%M')}) — записал как есть")
+        where = f" ({place['city']})" if place else ""
+        parts.append(f"записал {local.strftime('%d.%m.%Y %H:%M')}{where}")
+        if b["total_pages"] and cmd.page >= b["total_pages"]:
+            parts.append("похоже, дочитана — скажите «дочитал книгу " + str(b["num"]) + "»")
+        return "; ".join(parts) + ".", {"action": "book_page", "ok": True, "book": _book_out(b), "page": cmd.page}
+
+    def _do_book_total(self, person, cmd, said):
+        b, why = self._find_book(person, cmd)
+        if b is None:
+            return why, {"action": "book_total", "ok": False}
+        b = self.store.update_book(b["id"], total_pages=cmd.total_pages)
+        return f"Книга {book_label(b)}: всего {cmd.total_pages} стр.", {"action": "book_total", "ok": True}
+
+    def _book_status(self, person, cmd, status: str, text: str):
+        b, why = self._find_book(person, cmd)
+        if b is None:
+            return why, {"action": f"book_{status}", "ok": False}
+        b = self.store.update_book(b["id"], status=status, finished_at=self.now() if status == "done" else None)
+        return f"{text}: {book_label(b)}.", {"action": f"book_{status}", "ok": True, "book": _book_out(b)}
+
+    def _do_book_done(self, person, cmd, said):
+        return self._book_status(person, cmd, "done", "Отметил как прочитанную")
+
+    def _do_book_pause(self, person, cmd, said):
+        return self._book_status(person, cmd, "paused", "Отложил (вернуть — отметьте страницу)")
+
+    def _do_book_delete(self, person, cmd, said):
+        if cmd.book_no is None and not cmd.book_ref:
+            return "Какую книгу удалить? Например: «удали книгу 3».", {"action": "book_delete", "ok": False}
+        return self._book_status(person, cmd, "deleted", "Удалил из списка")
+
+    def _do_books(self, person, cmd, said):
+        rows = self.books_table(person)
+        if not rows:
+            return ("Книг пока нет. Зарегистрируйте: «зарегистрируй книгу Л.Н. Толстой „Война и мир“».",
+                    {"action": "books"})
+        status = {"reading": "читаю", "paused": "отложена", "done": "прочитана"}
+        lines = []
+        for r in rows:
+            page = f"стр. {r['page']}" + (f" из {r['total_pages']} ({r['percent']} %)" if r["percent"] is not None
+                                          else "") if r["page"] is not None else "ещё не отмечали"
+            last = f", {r['last_text']}" if r.get("last_text") else ""
+            lines.append(f"• {book_label(r)} — {status.get(r['status'], r['status'])}, {page}{last}")
+        return "Книги:\n" + "\n".join(lines), {"action": "books"}
+
+    def books_table(self, person: str) -> list[dict]:
+        """Таблица книг: всё о книге и её прогресс (books.stats), время последней записи — по поясу того места."""
+        now = self.now()
+        books = self.store.books(person)
+        log = self.store.reading_log(person, [b["id"] for b in books]) if books else []
+        out = []
+        for b in books:
+            st = stats(b, [r for r in log if r["book_id"] == b["id"]], now)
+            row = {**_book_out(b), **{k: _iso(v) for k, v in st.items()}}
+            if st["last_at"] is not None:
+                tz = ZoneInfo(st["last_tz"]) if _valid(st["last_tz"]) else self.host_tz()
+                row["last_text"] = st["last_at"].astimezone(tz).strftime("%d.%m.%Y %H:%M") + (
+                    f" ({st['last_city']})" if st["last_city"] else "")
+            out.append(row)
+        return out
+
+    def book_history(self, person: str, book_id: int) -> dict | None:
+        b = self.store.book_by_id(person, book_id)
+        if b is None:
+            return None
+        rows, prev = [], None
+        for r in self.store.reading_log(person, [book_id]):
+            tz = ZoneInfo(r["tz"]) if _valid(r.get("tz")) else self.host_tz()
+            local = r["at"].astimezone(tz)
+            rows.append({"id": r["id"], "at": _iso(r["at"]), "local_text": local.strftime("%d.%m.%Y %H:%M"),
+                         "utc_offset": utc_offset(local), "page": r["page"], "city": r.get("city"),
+                         "delta": None if prev is None else r["page"] - prev})
+            prev = r["page"]
+        return {"book": _book_out(b), "entries": list(reversed(rows))}
+
     # ---------- окончание сессии (таймер) ----------
 
     def compose_end(self, session: dict, now: datetime | None = None) -> tuple[str, dict]:
@@ -338,6 +474,7 @@ class Secretary:
             "session": _session_out(run, now) if run else None,
             "today": self._today(person, local),
             "unread": [_notice_out(n) for n in self.store.notices(person, unread=True)],
+            "books": [r for r in self.books_table(person) if r["status"] == "reading"],
         }
 
 
@@ -362,6 +499,18 @@ def _session_out(r: dict, now: datetime) -> dict:
             "ends_at": _iso(r["ends_at"]), "remaining_s": max(0, int((r["ends_at"] - now).total_seconds()))}
 
 
+def _valid(tz: str | None) -> bool:
+    from copilot1c.secretary.places import valid_tz
+
+    return bool(tz) and valid_tz(tz)
+
+
+def _book_out(b: dict) -> dict:
+    return {"id": b["id"], "num": b["num"], "author": b["author"], "title": b["title"], "total_pages": b["total_pages"],
+            "status": b["status"], "created_at": _iso(b["created_at"]), "finished_at": _iso(b.get("finished_at")),
+            "label": book_label(b)}
+
+
 def _notice_out(n: dict) -> dict:
     return {"id": n["id"], "kind": n["kind"], "text": n["text"], "data": n["data"], "created_at": _iso(n["created_at"]),
             "read": n["read_at"] is not None}
@@ -378,7 +527,14 @@ MODEL_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["place", "work", "rest", "stop", "status", "where",
-                                                          "history", "cancel_trip", "unknown"]},
+                                                          "history", "cancel_trip", "book_add", "book_page",
+                                                          "book_total", "book_done", "book_pause", "books",
+                                                          "unknown"]},
+                    "book_no": {"type": "integer", "description": "номер книги, если назван"},
+                    "page": {"type": "integer", "description": "страница, на которой человек сейчас"},
+                    "author": {"type": "string"},
+                    "title": {"type": "string", "description": "название книги"},
+                    "total_pages": {"type": "integer", "description": "всего страниц в книге"},
                     "place": {"type": "string", "description": "город, как сказано"},
                     "date": {"type": "string", "description": "дата переезда YYYY-MM-DD, если названа"},
                     "minutes": {"type": "integer"},
@@ -401,10 +557,20 @@ def model_parse(text: str, today: date, settings) -> list[Command]:
         system="Ты секретарь. Разбери фразу в команды: place — человек находится или едет в город (date — когда, "
                "если не сейчас); work — рабочая сессия на minutes минут или до until; rest — перерыв; stop — "
                "остановить таймер; status — сколько осталось; where — где я, время, погода; history — где я был; "
-               "cancel_trip — отменить поездку. Не относится к этому — unknown.")
+               "cancel_trip — отменить поездку; book_add — зарегистрировать книгу (author, title); book_page — "
+               "отметить страницу (book_no или title, page); book_total — сколько всего страниц; book_done — "
+               "дочитал; book_pause — отложил; books — список книг. Не относится к этому — unknown.")
     out = []
     for c in data.get("commands", []):
         a = c.get("action")
+        if a in ("book_add", "book_page", "book_total", "book_done", "book_pause", "books"):
+            cmd = Command(a, book_no=c.get("book_no"), page=c.get("page"), author=c.get("author"),
+                          title=c.get("title"), total_pages=c.get("total_pages"),
+                          book_ref=c.get("title") if a != "book_add" and not c.get("book_no") else None)
+            if (a == "book_add" and not cmd.title) or (a == "book_page" and not cmd.page):
+                continue
+            out.append(cmd)
+            continue
         if a not in ("place", "work", "rest", "stop", "status", "where", "history", "cancel_trip"):
             continue
         when = None

@@ -56,3 +56,32 @@ CREATE TABLE IF NOT EXISTS sec_notices (
     read_at     timestamptz
 );
 CREATE INDEX IF NOT EXISTS sec_notices_person_idx ON sec_notices (person, id);
+
+-- Книги: несколько параллельно, номер — у каждого человека свой (книга № 1, № 2…). status: reading | paused |
+-- done | deleted (удалённые не показываются, номер не переиспользуется).
+CREATE TABLE IF NOT EXISTS sec_books (
+    id           bigserial PRIMARY KEY,
+    person       text NOT NULL,
+    num          int NOT NULL,
+    author       text NOT NULL DEFAULT '',
+    title        text NOT NULL,
+    total_pages  int,
+    status       text NOT NULL DEFAULT 'reading',
+    said         text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    finished_at  timestamptz,
+    UNIQUE (person, num)
+);
+
+-- Журнал чтения: страница на момент записи, где человек был (город и пояс — для местного времени в таблице)
+CREATE TABLE IF NOT EXISTS sec_reading (
+    id       bigserial PRIMARY KEY,
+    book_id  bigint NOT NULL REFERENCES sec_books(id) ON DELETE CASCADE,
+    person   text NOT NULL,
+    page     int NOT NULL,
+    at       timestamptz NOT NULL DEFAULT now(),
+    city     text,
+    tz       text,
+    said     text
+);
+CREATE INDEX IF NOT EXISTS sec_reading_book_idx ON sec_reading (book_id, at);
