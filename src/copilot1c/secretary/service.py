@@ -567,7 +567,8 @@ class Secretary:
 
 def weather_line(w: dict) -> str:
     if w.get("ok"):
-        src = " (Яндекс Погода)" if "pogoda" in (w.get("url") or "") else ""
+        url = w.get("url") or ""
+        src = " (Яндекс Погода)" if "pogoda" in url else " (Яндекс)" if "yandex." in url else ""
         return f"Погода сейчас: {w['text']}{src}."
     return f"Погоду получить не удалось: {w.get('reason', 'нет данных')}."
 

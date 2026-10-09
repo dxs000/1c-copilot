@@ -145,9 +145,9 @@ def parse_results(xml: bytes, k: int) -> list[dict[str, str]]:
     return out
 
 
-def web_search(query: str, settings, sites: list[str] | None = None, k: int = 5,
-               client: httpx.Client | None = None) -> dict[str, Any]:
-    """Поиск. Возвращает {query_sent, removed, results[]}; в журнал — исходный и отправленный запрос."""
+def _search_raw(query: str, settings, sites: list[str] | None, k: int, fmt: str,
+                client: httpx.Client | None) -> tuple[bytes, str, list[str]]:
+    """Запрос к Search API v2: (rawData, отправленный текст, что вырезано). fmt — FORMAT_XML | FORMAT_HTML."""
     if not (settings.yc_api_key and settings.yc_folder_id):
         raise WebError("нет ключа AI Studio — поиск в интернете недоступен")
     sent, removed = sanitize_query(query, settings)
@@ -159,23 +159,39 @@ def web_search(query: str, settings, sites: list[str] | None = None, k: int = 5,
                       "page": "0", "fixTypoMode": "FIX_TYPO_MODE_ON"},
             "groupSpec": {"groupMode": "GROUP_MODE_DEEP", "groupsOnPage": str(min(max(k, 1), 10)), "docsInGroup": "1"},
             "maxPassages": "3", "region": "225", "l10n": "LOCALIZATION_RU", "folderId": settings.yc_folder_id,
-            "responseFormat": "FORMAT_XML"}
+            "responseFormat": fmt}
     c = client or httpx.Client(timeout=20)
     try:
         r = c.post(SEARCH_URL, json=body, headers={"Authorization": f"Api-Key {settings.yc_api_key}"})
     except httpx.HTTPError as exc:
-        journal(settings, {"query": query, "sent": text, "removed": removed, "error": type(exc).__name__})
+        journal(settings, {"query": query, "sent": text, "removed": removed, "format": fmt, "error": type(exc).__name__})
         raise WebError(f"Search API недоступен: {type(exc).__name__}") from exc
     finally:
         if client is None:
             c.close()
     if r.status_code != 200:
-        journal(settings, {"query": query, "sent": text, "removed": removed, "error": f"HTTP {r.status_code}"})
+        journal(settings, {"query": query, "sent": text, "removed": removed, "format": fmt,
+                           "error": f"HTTP {r.status_code}"})
         raise WebError(f"Search API: HTTP {r.status_code} {r.text[:200]}")
-    raw = base64.b64decode(r.json().get("rawData", "") or b"")
+    return base64.b64decode(r.json().get("rawData", "") or b""), text, removed
+
+
+def web_search(query: str, settings, sites: list[str] | None = None, k: int = 5,
+               client: httpx.Client | None = None) -> dict[str, Any]:
+    """Поиск. Возвращает {query_sent, removed, results[]}; в журнал — исходный и отправленный запрос."""
+    raw, text, removed = _search_raw(query, settings, sites, k, "FORMAT_XML", client)
     results = parse_results(raw, k)
     journal(settings, {"query": query, "sent": text, "removed": removed, "results": [x["url"] for x in results]})
     return {"query_sent": text, "removed": removed, "results": results}
+
+
+def web_search_page(query: str, settings, client: httpx.Client | None = None, max_chars: int = 30000) -> dict[str, Any]:
+    """Страница выдачи целиком (FORMAT_HTML) текстом: в ней, кроме ссылок, бывают блоки Яндекса с ответом сразу
+    (погода «сейчас», курс, время). {query_sent, title, text}."""
+    raw, text, removed = _search_raw(query, settings, None, 10, "FORMAT_HTML", client)
+    title, body = html_text(raw, "utf-8")
+    journal(settings, {"query": query, "sent": text, "removed": removed, "format": "FORMAT_HTML", "chars": len(body)})
+    return {"query_sent": text, "title": title, "text": body[:max_chars]}
 
 
 # ---------- чтение страницы ----------

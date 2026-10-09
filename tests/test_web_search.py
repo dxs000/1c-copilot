@@ -144,3 +144,19 @@ def test_settings_blocked_terms_from_env(monkeypatch):
     assert s.web_blocked_terms == ("Pierre Fabre", "Пьер Фабр", "ПФ Рус")
     assert "ПФ Рус" in web.blocked_terms(SimpleNamespace(internal_domains=(), analysts=(),
                                                          web_blocked_terms=s.web_blocked_terms))
+
+
+def test_web_search_page_returns_serp_text(tmp_path):
+    """FORMAT_HTML: страница выдачи текстом — для блоков Яндекса с ответом сразу (погода «сейчас»)."""
+    seen = {}
+    serp = ("<html><head><title>погода Брянск — Яндекс</title><script>x()</script></head><body>"
+            "<div class='weather'>Брянск <b>Сейчас +8°</b> Ощущается как +5°</div><p>ссылки</p></body></html>")
+
+    def handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"rawData": base64.b64encode(serp.encode()).decode()})
+
+    out = web.web_search_page("погода Брянск", _settings(tmp_path),
+                              client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert seen["body"]["responseFormat"] == "FORMAT_HTML" and seen["body"]["query"]["queryText"] == "погода Брянск"
+    assert "Сейчас +8°" in out["text"] and "x()" not in out["text"] and out["title"].startswith("погода Брянск")

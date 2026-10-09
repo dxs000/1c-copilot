@@ -179,14 +179,15 @@ def test_weather_from_yandex_search(monkeypatch):
         return {"found": True, "temperature_c": 12, "feels_like_c": 9, "condition": "Облачно", "wind_ms": 4,
                 "humidity": 81, "source": 2}
 
-    w = weather_mod.current_weather("Варшава", "Польша", s, search=search, extract=extract)
+    no_page = lambda q, settings: {"query_sent": q, "text": "Погода в Варшаве на 10 дней"}  # noqa: E731
+    w = weather_mod.current_weather("Варшава", "Польша", s, search=search, extract=extract, page=no_page)
     assert w["ok"] and w["text"] == "+12 °C, ощущается как +9, облачно, ветер 4 м/с, влажность 81 %"
-    assert w["url"] == "https://yandex.ru/pogoda/warsaw" and calls == [("погода Варшава Польша сейчас", ["yandex.ru"])]
-    assert weather_mod.current_weather("Варшава", "Польша", s, search=search, extract=extract)["cached"]
+    assert w["url"] == "https://yandex.ru/pogoda/warsaw" and calls == [("погода Варшава сейчас", ["yandex.ru"])]
+    assert weather_mod.current_weather("Варшава", "Польша", s, search=search, extract=extract, page=no_page)["cached"]
     assert len(calls) == 1  # второй раз — из кэша
 
     weather_mod.clear_cache()
-    no_fact = weather_mod.current_weather("Варшава", "Польша", s, search=search,
+    no_fact = weather_mod.current_weather("Варшава", "Польша", s, search=search, page=no_page,
                                           extract=lambda *a: {"found": False})
     assert not no_fact["ok"] and no_fact["url"].startswith("https://yandex.ru/pogoda")
     assert not weather_mod.current_weather("Варшава", "Польша", Settings(yc_api_key="", yc_folder_id=""))["ok"]
@@ -537,3 +538,31 @@ def test_delete_all_wrong_marks(sec):
     assert r == "Удалил отметки книги № 1 со страницей 5: 3. Теперь: стр. 15."
     assert "«Предисловие» — стр. 5" in sec.say("ivan", "Книга №1 стр.5 Предисловие")["reply"]
     assert [e["page"] for e in sec.book_history("ivan", sec.books_table("ivan")[0]["id"])["entries"]] == [15]
+
+
+def test_weather_from_search_page_block():
+    """Шаг 1: страница выдачи (FORMAT_HTML) с блоком погоды — модели уходит только текст вокруг «°»."""
+    weather_mod.clear_cache()
+    s = Settings(yc_api_key="k", yc_folder_id="f")
+    page_text = ("Яндекс. Поиск. " + "меню " * 400 + "Брянск Сейчас +8° Ощущается как +5° Облачно с прояснениями "
+                 "Ветер 3 м/с Влажность 87% " + "реклама " * 400)
+    seen = {}
+
+    def extract(city, country, text):
+        seen["text"] = text
+        return {"found": True, "temperature_c": 8, "feels_like_c": 5, "condition": "Облачно с прояснениями",
+                "wind_ms": 3, "humidity": 87}
+
+    def search(*a, **kw):
+        raise AssertionError("сниппеты не нужны — погода нашлась на странице выдачи")
+
+    steps = []
+    w = weather_mod.current_weather("Брянск", "Россия", s, search=search, extract=extract,
+                                    page=lambda q, settings: {"query_sent": q, "text": page_text}, steps=steps)
+    assert w["ok"] and w["text"] == "+8 °C, ощущается как +5, облачно с прояснениями, ветер 3 м/с, влажность 87 %"
+    assert "Сейчас +8°" in seen["text"] and len(seen["text"]) < 1500  # не вся страница
+    assert steps[0]["step"] == "страница выдачи" and steps[0]["query"] == "погода Брянск"
+    from copilot1c.secretary.service import weather_line
+
+    assert weather_line(w).endswith("(Яндекс).")
+    assert weather_mod.weather_window("нет температуры") == ""

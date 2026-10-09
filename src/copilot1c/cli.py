@@ -370,6 +370,37 @@ def web_search_cmd(query: str, sites: list[str] = typer.Option(None, "--site", h
         typer.echo(f"\n--- {page['title']} ({len(page['text'])} знаков) ---\n{page['text'][:1500]}")
 
 
+@app.command("weather")
+def weather_cmd(city: str = typer.Argument(..., help="Город, как в «Секретаре»: Брянск, Варшава…")):
+    """Погода сейчас так, как её получает «Секретарь» (Search API → модель), с подробностями по шагам."""
+    import json as _json
+
+    from copilot1c.secretary.places import NotAPlace, resolve
+    from copilot1c.secretary.weather import clear_cache, current_weather
+
+    s = get_settings()
+    try:
+        place = resolve(city, s)
+    except NotAPlace as exc:
+        raise typer.Exit(typer.echo(f"Город: {exc}") or 1) from exc
+    typer.echo(f"Город: {place.city} ({place.country}), {place.tz}")
+    clear_cache()
+    steps: list = []
+    w = current_weather(place.city, place.country, s, steps=steps)
+    for st in steps:
+        typer.echo(f"\n--- {st['step']} ---")
+        for key in ("query", "chars", "error"):
+            if st.get(key) is not None:
+                typer.echo(f"{key}: {st[key]}")
+        if st.get("excerpt"):
+            typer.echo("текст вокруг «°»:\n" + st["excerpt"])
+        for r in st.get("results", []):
+            typer.echo(f"• {r['url']}\n  {r['snippet']}")
+        if "model" in st:
+            typer.echo("модель: " + _json.dumps(st["model"], ensure_ascii=False))
+    typer.echo("\nИтог: " + (w["text"] if w.get("ok") else f"не удалось — {w.get('reason')}"))
+
+
 @app.command("eval")
 def eval_cmd(golden: Path = typer.Argument(..., help="JSON с эталонными вопросами (см. tests/eval/example.json)"),
              answers: bool = typer.Option(False, help="Проверять и ответы агента (дольше и дороже)"),
