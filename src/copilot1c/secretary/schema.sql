@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS sec_places (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE sec_places ADD COLUMN IF NOT EXISTS on_date date;
+ALTER TABLE sec_places ADD COLUMN IF NOT EXISTS lat double precision;  -- координаты — для астрономии
+ALTER TABLE sec_places ADD COLUMN IF NOT EXISTS lon double precision;
 CREATE INDEX IF NOT EXISTS sec_places_person_idx ON sec_places (person, effective_at DESC, id DESC);
 
 -- Города, найденные моделью: форма из фразы → город, страна, пояс (чтобы не спрашивать модель повторно)
@@ -41,6 +43,9 @@ CREATE TABLE IF NOT EXISTS sec_sessions (
     finished_at  timestamptz,
     said         text
 );
+ALTER TABLE sec_place_names ADD COLUMN IF NOT EXISTS lat double precision;
+ALTER TABLE sec_place_names ADD COLUMN IF NOT EXISTS lon double precision;
+
 CREATE INDEX IF NOT EXISTS sec_sessions_due_idx ON sec_sessions (ends_at) WHERE status IN ('running', 'finishing');
 CREATE INDEX IF NOT EXISTS sec_sessions_person_idx ON sec_sessions (person, started_at DESC);
 
@@ -97,3 +102,32 @@ CREATE TABLE IF NOT EXISTS sec_book_toc (
     UNIQUE (book_id, title)
 );
 CREATE INDEX IF NOT EXISTS sec_book_toc_page_idx ON sec_book_toc (book_id, page);
+
+-- Небо: события Солнца, Луны, планет и звёзд в месте, где человек (secretary/astro.py). Планировщик таймера
+-- считает их на сутки вперёд, таймер в момент события пишет тихое сообщение (sec_notices.kind = 'astro').
+-- Ключ — на местные сутки: пересчёт не плодит дубли. Переехал — события прежнего места пропускаются (skipped).
+CREATE TABLE IF NOT EXISTS sec_astro (
+    id         bigserial PRIMARY KEY,
+    person     text NOT NULL,
+    place_id   bigint NOT NULL,
+    body       text NOT NULL,
+    kind       text NOT NULL,
+    local_day  date NOT NULL,
+    at         timestamptz NOT NULL,
+    alt        double precision,
+    text       text NOT NULL,
+    data       jsonb NOT NULL DEFAULT '{}',
+    status     text NOT NULL DEFAULT 'pending',   -- pending | sent | skipped
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (person, place_id, body, kind, local_day)
+);
+CREATE INDEX IF NOT EXISTS sec_astro_due_idx ON sec_astro (at) WHERE status = 'pending';
+
+-- Настройки секретаря человека: присылать ли небо, планеты, звёзды
+CREATE TABLE IF NOT EXISTS sec_settings (
+    person      text PRIMARY KEY,
+    astro       boolean NOT NULL DEFAULT true,
+    planets     boolean NOT NULL DEFAULT true,
+    stars       boolean NOT NULL DEFAULT true,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);

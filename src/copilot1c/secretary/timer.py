@@ -1,19 +1,23 @@
 """Таймер секретаря — поток внутри демона ядра.
 
 Раз в секунду проверяет sec_sessions: у идущих сессий вышло время → сообщение (местное время, погода) в
-sec_notices, сессия done. Время хранится в базе, поэтому таймер переживает перезапуск службы: сессия,
-закончившаяся, пока ядро было остановлено, завершается сразу после старта (в сообщении — сколько опоздало).
+sec_notices, сессия done. Там же — события неба (sec_astro): наступило → тихое сообщение; раз в 10 минут
+события планируются на сутки вперёд для каждого, у кого записано место. Время хранится в базе, поэтому
+таймер переживает перезапуск службы: сессия, закончившаяся, пока ядро было остановлено, завершается
+сразу после старта (в сообщении — сколько опоздало).
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from copilot1c.config import Settings
 
 log = logging.getLogger("copilot1c.secretary")
 POLL_SECONDS = 1.0
+PLAN_SECONDS = 600
 
 
 class SecretaryTimer:
@@ -46,6 +50,7 @@ class SecretaryTimer:
 
         g = None
         recovered = False
+        next_plan = 0.0
         while not self._stop.is_set():
             try:
                 if g is None:
@@ -62,6 +67,15 @@ class SecretaryTimer:
                 for row in sec.finish_due():
                     self.fired += 1
                     log.info("таймер: сессия %s завершена, сообщение %s", row.get("session_id"), row.get("id"))
+                for row in sec.deliver_sky():
+                    log.debug("небо: %s", row.get("text"))
+                if time.monotonic() >= next_plan:  # события неба — на сутки вперёд, раз в 10 минут
+                    next_plan = time.monotonic() + PLAN_SECONDS
+                    for person in sec.store.persons():
+                        try:
+                            sec.plan_sky(person)
+                        except Exception:  # noqa: BLE001 — один человек не мешает остальным
+                            log.exception("небо: планирование для %s", person)
             except Exception:  # noqa: BLE001 — поток не должен умирать; соединение — заново
                 log.exception("таймер секретаря")
                 if g is not None:

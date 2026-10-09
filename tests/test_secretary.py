@@ -219,8 +219,8 @@ def sec():
     clock = Clock(datetime(2026, 10, 9, 5, 0, tzinfo=UTC))  # 07:00 в Варшаве (UTC+2)
     weather_calls = []
     sx = Secretary(g.conn, s, now=clock, weather=lambda c, k: weather_calls.append(c) or WEATHER)
-    for t in ("sec_notices", "sec_sessions", "sec_places", "sec_place_names", "sec_reading", "sec_book_toc",
-              "sec_books"):
+    for t in ("sec_notices", "sec_sessions", "sec_astro", "sec_settings", "sec_places", "sec_place_names", "sec_reading",
+              "sec_book_toc", "sec_books"):
         g.conn.execute(f"DELETE FROM {t}")
     g.conn.commit()
     sx.clock, sx.weather_calls = clock, weather_calls
@@ -566,3 +566,93 @@ def test_weather_from_search_page_block():
 
     assert weather_line(w).endswith("(Яндекс).")
     assert weather_mod.weather_window("нет температуры") == ""
+
+
+# ---------- небо ----------
+
+MSK = __import__("zoneinfo").ZoneInfo("Europe/Moscow")
+
+
+def test_sky_events_bryansk():
+    from copilot1c.secretary.astro import events
+
+    start = datetime(2026, 10, 8, 21, 0, tzinfo=UTC)  # 00:00 по Москве 9.10
+    ev = events(53.243, 34.364, MSK, start, start + timedelta(hours=24))
+    by = {(e.body, e.kind): e for e in ev}
+    noon = by[("sun", "transit")]
+    # полдень: 12:00 + (45° − 34,36°) × 4 мин − уравнение времени ≈ 12:29; высота = 90 − 53,24 − 6,3 ≈ 30,4°
+    assert noon.at.astimezone(MSK).strftime("%H:%M") == "12:29" and abs(noon.alt - 30.4) < 0.3
+    assert by[("sun", "rise")].at.astimezone(MSK).strftime("%H:%M") in ("06:56", "06:57", "06:58")
+    assert "Долгота дня 11 ч" in by[("sun", "rise")].text
+    assert "убывающая" in by[("moon", "rise")].text  # за сутки до новолуния 10.10
+    assert ("Sirius", "transit") in by and ("Vega", "transit") in by
+    assert ("Canopus", "transit") not in by and ("Acrux", "transit") not in by  # в Брянске не восходят
+    assert "(светло — не видно)" in by[("mars", "transit")].text and "светло" not in by[("Sirius", "transit")].text
+    assert [e.at for e in ev] == sorted(e.at for e in ev)
+    nxt = events(53.243, 34.364, MSK, start + timedelta(hours=24), start + timedelta(hours=48))
+    new = [e for e in nxt if e.kind == "new_moon"]
+    assert len(new) == 1 and new[0].text.startswith("Новолуние — ") and "(10.10)" in new[0].text
+
+
+def test_sky_polar_night_has_no_sunrise():
+    from copilot1c.secretary.astro import events
+
+    start = datetime(2026, 12, 21, 0, 0, tzinfo=UTC)
+    ev = events(68.970, 33.075, MSK, start, start + timedelta(hours=24), stars=False)  # Мурманск, полярная ночь
+    assert not [e for e in ev if e.body == "sun"]  # ни восхода, ни захода, кульминация под горизонтом
+
+
+def test_sky_setting_phrases():
+    for text, notes in [("выключи небо", ["astro", "off"]), ("без звёзд", ["stars", "off"]),
+                        ("не присылай планеты", ["planets", "off"]), ("включи небо", ["astro", "on"]),
+                        ("звёзды включи", ["stars", "on"])]:
+        c = _one(text)
+        assert (c.action, c.notes) == ("sky_set", notes), text
+    assert _one("я в Брянске").action == "place"
+
+
+@needs_pg
+def test_sky_planned_delivered_and_quiet(sec):
+    sec.say("ivan", "я в Брянске")  # 08:00 мск; запись места сразу планирует небо
+    n = sec.store._one("SELECT count(*) AS n FROM sec_astro WHERE person = 'ivan'")["n"]
+    assert n >= 25
+    assert sec.plan_sky("ivan") == 0  # повтор не дублирует
+    sec.clock.at = datetime(2026, 10, 9, 9, 31, tzinfo=UTC)  # 12:31 мск — сразу после полудня
+    sent = sec.deliver_sky()
+    texts = [r["text"] for r in sent]
+    assert any(t.startswith("Верхняя кульминация Солнца — 12:29, высота 30,4°.") and t.endswith("Брянск.") for t in texts)
+    assert all(r["kind"] == "astro" for r in sent)
+    assert not any("Восход Солнца" in t for t in texts)  # восход 06:57 был до записи места — не досылается
+    st = sec.state("ivan")
+    assert any(u["kind"] == "astro" for u in st["unread"])
+    sec.clock.tick(hours=4)
+    assert not [u for u in sec.state("ivan")["unread"] if u["kind"] == "astro" and "Солнца — 12:29" in u["text"]]
+
+
+@needs_pg
+def test_sky_move_and_settings(sec):
+    sec.say("ivan", "я в Брянске")
+    r = sec.say("ivan", "без звёзд")
+    assert r["reply"].startswith("Кульминации звёзд выключены")
+    assert not sec.store._one("SELECT count(*) AS n FROM sec_astro WHERE person = 'ivan' AND status = 'pending' "
+                              "AND data->>'kind' = 'star'")["n"]
+    sec.say("ivan", "я в Варшаве")  # переезд: события Брянска пропускаются, Варшавы — запланированы
+    rows = sec.store._rows("SELECT DISTINCT data->>'city' AS c FROM sec_astro WHERE person = 'ivan' AND status = 'pending'")
+    assert [r["c"] for r in rows] == ["Варшава"]
+    sec.say("ivan", "выключи небо")
+    assert sec.plan_sky("ivan") == 0
+    sec.say("ivan", "включи небо")  # пропущенные будущие события того же места — снова в очереди
+    assert sec.store._one("SELECT count(*) AS n FROM sec_astro WHERE person = 'ivan' AND status = 'pending'")["n"] > 5
+    sec.say("ivan", "выключи небо")
+    sec.clock.tick(hours=12)
+    assert sec.deliver_sky() == [] and sec.plan_sky("ivan") == 0
+
+
+@needs_pg
+def test_sky_coords_filled_for_old_place(sec):
+    sec.say("ivan", "я в Брянске")
+    sec.store._rows("UPDATE sec_places SET lat = NULL, lon = NULL WHERE person = 'ivan'")  # запись до этой версии
+    sec.store.skip_pending_astro("ivan")
+    sec.store._rows("DELETE FROM sec_astro WHERE person = 'ivan'")
+    assert sec.plan_sky("ivan") > 0
+    assert sec.store._one("SELECT lat FROM sec_places WHERE person = 'ivan'")["lat"] == 53.243

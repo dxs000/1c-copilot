@@ -17,6 +17,7 @@ dependencies = [
     "python-dateutil>=2.9.0.post0",
     "openpyxl>=3.1.5",
     "httpx>=0.28.1",
+    "ephem>=4.1",  # астрономия секретаря: Солнце, Луна, планеты, звёзды — локально, без сети
 ]
 
 [project.optional-dependencies]

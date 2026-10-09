@@ -52,9 +52,19 @@ class SecretaryStore:
 
     def add_place(self, person: str, place: Place, effective_at: datetime, direction: str, said: str,
                   on_date: date | None = None) -> dict:
-        return self._one("""INSERT INTO sec_places (person, city, country, tz, effective_at, direction, said, on_date)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
-                         (person, place.city, place.country, place.tz, effective_at, direction, said, on_date))
+        return self._one("""INSERT INTO sec_places (person, city, country, tz, effective_at, direction, said, on_date,
+                                                    lat, lon)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                         (person, place.city, place.country, place.tz, effective_at, direction, said, on_date,
+                          place.lat, place.lon))
+
+    def set_place_coords(self, place_id: int, lat: float, lon: float) -> None:
+        self._rows("UPDATE sec_places SET lat = %s, lon = %s WHERE id = %s", (lat, lon, place_id))
+
+    def coords_by_city(self, city: str) -> tuple[float, float] | None:
+        """Координаты города, уже найденные моделью раньше (кэш форм)."""
+        r = self._one("""SELECT lat, lon FROM sec_place_names WHERE city = %s AND lat IS NOT NULL LIMIT 1""", (city,))
+        return (r["lat"], r["lon"]) if r else None
 
     def place_at(self, person: str, at: datetime) -> dict | None:
         return self._one("""SELECT * FROM sec_places WHERE person = %s AND NOT cancelled AND effective_at <= %s
@@ -75,13 +85,13 @@ class SecretaryStore:
     # кэш городов, найденных моделью (интерфейс для places.resolve)
     def get(self, form: str) -> Place | None:
         r = self._one("SELECT * FROM sec_place_names WHERE form = %s", (form,))
-        return Place(r["city"], r["country"], r["tz"], "кэш") if r else None
+        return Place(r["city"], r["country"], r["tz"], "кэш", r.get("lat"), r.get("lon")) if r else None
 
     def put(self, form: str, place: Place) -> None:
-        self._rows("""INSERT INTO sec_place_names (form, city, country, tz) VALUES (%s,%s,%s,%s)
+        self._rows("""INSERT INTO sec_place_names (form, city, country, tz, lat, lon) VALUES (%s,%s,%s,%s,%s,%s)
                       ON CONFLICT (form) DO UPDATE SET city = EXCLUDED.city, country = EXCLUDED.country,
-                                                     tz = EXCLUDED.tz""",
-                   (form, place.city, place.country, place.tz))
+                                                     tz = EXCLUDED.tz, lat = EXCLUDED.lat, lon = EXCLUDED.lon""",
+                   (form, place.city, place.country, place.tz, place.lat, place.lon))
 
     # ---------- сессии ----------
 
@@ -229,6 +239,66 @@ class SecretaryStore:
     def delete_toc(self, book_id: int, title: str) -> int:
         return len(self._rows("DELETE FROM sec_book_toc WHERE book_id = %s AND lower(title) = lower(%s) RETURNING id",
                               (book_id, title)))
+
+    # ---------- небо ----------
+
+    def settings(self, person: str) -> dict:
+        r = self._one("SELECT * FROM sec_settings WHERE person = %s", (person,))
+        return r or {"person": person, "astro": True, "planets": True, "stars": True}
+
+    def set_settings(self, person: str, **fields) -> dict:
+        cur = self.settings(person)
+        cur.update(fields)
+        return self._one("""INSERT INTO sec_settings (person, astro, planets, stars) VALUES (%s,%s,%s,%s)
+                            ON CONFLICT (person) DO UPDATE SET astro = EXCLUDED.astro, planets = EXCLUDED.planets,
+                                                               stars = EXCLUDED.stars, updated_at = now()
+                            RETURNING *""", (person, cur["astro"], cur["planets"], cur["stars"]))
+
+    def persons(self) -> list[str]:
+        return [r["person"] for r in self._rows("SELECT DISTINCT person FROM sec_places WHERE NOT cancelled")]
+
+    def add_astro(self, person: str, place_id: int, rows: list[tuple]) -> int:
+        """rows: (body, kind, local_day, at, alt, text, data_json). Уже запланированное и отправленное не дублируется."""
+        if not rows:
+            return 0
+        try:
+            with self.conn.cursor() as cur:
+                n = 0
+                for body, kind, day, at, alt, text, data in rows:
+                    # пропущенное раньше (выключали небо, уезжали и вернулись) — снова в очередь: планируются только
+                    # будущие события, так что опоздавшие не воскресают
+                    cur.execute("""INSERT INTO sec_astro (person, place_id, body, kind, local_day, at, alt, text, data)
+                                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                   ON CONFLICT (person, place_id, body, kind, local_day) DO UPDATE
+                                   SET at = EXCLUDED.at, alt = EXCLUDED.alt, text = EXCLUDED.text, data = EXCLUDED.data,
+                                       status = 'pending'
+                                   WHERE sec_astro.status = 'skipped'""",
+                                (person, place_id, body, kind, day, at, alt, text, data))
+                    n += cur.rowcount
+            self.conn.commit()
+            return n
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def due_astro(self, now: datetime, limit: int = 100) -> list[dict]:
+        return self._rows("""SELECT * FROM sec_astro WHERE status = 'pending' AND at <= %s ORDER BY at LIMIT %s""",
+                          (now, limit))
+
+    def mark_astro(self, astro_id: int, status: str) -> None:
+        self._rows("UPDATE sec_astro SET status = %s WHERE id = %s", (status, astro_id))
+
+    def skip_pending_astro(self, person: str) -> int:
+        return len(self._rows("""UPDATE sec_astro SET status = 'skipped' WHERE person = %s AND status = 'pending'
+                                 RETURNING id""", (person,)))
+
+    def add_notice(self, person: str, kind: str, text: str, data: dict) -> dict:
+        return self._one("""INSERT INTO sec_notices (person, kind, text, data) VALUES (%s,%s,%s,%s) RETURNING *""",
+                         (person, kind, text, json.dumps(data, ensure_ascii=False, default=str)))
+
+    def mark_old_read(self, person: str, kind: str, before: datetime) -> int:
+        return len(self._rows("""UPDATE sec_notices SET read_at = now() WHERE person = %s AND kind = %s
+                                 AND read_at IS NULL AND created_at < %s RETURNING id""", (person, kind, before)))
 
     # ---------- сообщения ----------
 

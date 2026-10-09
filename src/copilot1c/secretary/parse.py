@@ -253,6 +253,26 @@ _HISTORY = re.compile(r"где\s+я\s+был\w*|истори\w*\s+(?:поезд�
 _HELP = re.compile(r"^\s*(?:помощь|help|что\s+ты\s+умеешь|\?)\s*$", re.IGNORECASE)
 
 
+_SKY_TARGET = {"stars": re.compile(r"звёзд\w*|звезд\w*", re.IGNORECASE),
+               "planets": re.compile(r"планет\w*", re.IGNORECASE),
+               "astro": re.compile(r"(?<![\wё])неб\w*|астроном\w*|восход\w*\s+и\s+заход\w*|кульминац\w*", re.IGNORECASE)}
+_SKY_OFF = re.compile(r"выключ\w*|отключ\w*|не\s+присыла\w*|не\s+надо|(?<![\wё])без(?![\wё])|хватит|убер\w*|"
+                      r"(?<![\wё])выкл", re.IGNORECASE)
+_SKY_ON = re.compile(r"(?<![\wё])включ\w*|присылай\w*|верни\w*|(?<![\wё])вкл(?![\wё])", re.IGNORECASE)
+
+
+def _sky_setting(t: str) -> Command | None:
+    """«выключи небо», «без звёзд», «включи планеты» — настройки сообщений о небе."""
+    target = next((k for k, rx in _SKY_TARGET.items() if rx.search(t)), None)
+    if target is None:
+        return None
+    if _SKY_OFF.search(t):
+        return Command("sky_set", notes=[target, "off"])
+    if _SKY_ON.search(t):
+        return Command("sky_set", notes=[target, "on"])
+    return None
+
+
 def parse(text: str, today: date) -> list[Command]:
     """Команды из фразы в порядке выполнения; пустой список — правила не поняли (дальше — модель)."""
     t = " ".join((text or "").split())
@@ -260,6 +280,9 @@ def parse(text: str, today: date) -> list[Command]:
         return []
     if _HELP.search(t):
         return [Command("help")]
+    sky = _sky_setting(t)
+    if sky is not None:
+        return [sky]
     from copilot1c.secretary.books import parse_book
 
     # исходный текст: оглавление — по строкам; книги — раньше остальных («закончил книгу» — не «стоп»)

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
@@ -32,6 +33,8 @@ HELP = ("Я веду ваш распорядок.\n"
         "• Оглавление: «Книга 1, стр. 5, Предисловие» или списком; "
         "отметка, где остановились: «Книга 1, остановился на стр. 15»; ошибочную — «удали последнюю отметку книги 1». "
         "Таблица — на странице «Книги».\n"
+        "• Небо — само, в момент события: восход, кульминация и заход Солнца и Луны, фазы Луны, кульминации "
+        "планет и ярчайших звёзд. «Выключи небо», «без звёзд», «без планет», «включи небо».\n"
         "По окончании сессии напишу точное местное время и погоду там, где вы находитесь.")
 
 
@@ -178,6 +181,7 @@ class Secretary:
                     + self._plans_hint(person, now), {"action": "place", "ok": True, "unchanged": True,
                                                        "place": _place_out(current)})
         row = self.store.add_place(person, place, now, cmd.direction or "arrive", said)
+        self._replan_sky(person)  # события неба — уже для нового места
         local = now.astimezone(tz)
         was = f" До этого: {current['city']}." if current else ""
         return (f"Записал: вы в городе {place.city} ({place.country}). Местное время {fmt_local(local)}.{was}"
@@ -268,6 +272,11 @@ class Secretary:
         return (f"{what}: осталось {fmt_minutes((left + 59) // 60)} (до "
                 f"{run['ends_at'].astimezone(local.tzinfo).strftime('%H:%M')}), прошло {fmt_minutes(passed)} из "
                 f"{fmt_minutes(run['minutes'])}. {totals}", {"action": "status"})
+
+    def _unread(self, person: str, now: datetime) -> list[dict]:
+        """Непрочитанные сообщения; о небе — только за последние 3 часа (за ночь их набирается десятки)."""
+        self.store.mark_old_read(person, "astro", now - timedelta(hours=3))
+        return [_notice_out(n) for n in self.store.notices(person, unread=True)]
 
     def _today(self, person: str, local: datetime) -> str:
         since = datetime.combine(local.date(), time(0), tzinfo=local.tzinfo)
@@ -504,6 +513,91 @@ class Secretary:
                                "read" if current is not None and e["page"] <= current else "ahead")} for e in toc]
         return {"book": _book_out(b), "entries": list(reversed(rows)), "toc": contents}
 
+    # ---------- небо ----------
+
+    def place_coords(self, place: dict) -> tuple[float, float] | None:
+        """Координаты места: из записи, справочника, кэша городов или (один раз) модели; найденное — в запись."""
+        if place.get("lat") is not None and place.get("lon") is not None:
+            return place["lat"], place["lon"]
+        from copilot1c.secretary.places import NotAPlace, known, resolve
+
+        p = known(place["city"])
+        coords = (p.lat, p.lon) if p and p.lat is not None else self.store.coords_by_city(place["city"])
+        if coords is None and self.s.yc_api_key and self.s.yc_folder_id:
+            try:
+                q = resolve(place["city"], self.s, cache=None)
+                coords = (q.lat, q.lon) if q.lat is not None else None
+            except NotAPlace:
+                coords = None
+        if coords is None:
+            return None
+        self.store.set_place_coords(place["id"], coords[0], coords[1])
+        return coords
+
+    def plan_sky(self, person: str, hours: int = 26) -> int:
+        """События неба на hours вперёд для места, где человек сейчас (повтор безопасен). Сколько добавлено."""
+        settings = self.store.settings(person)
+        if not settings["astro"]:
+            return 0
+        now = self.now()
+        place = self.place(person, now)
+        if place is None:
+            return 0
+        coords = self.place_coords(place)
+        if coords is None:
+            return 0
+        from copilot1c.secretary.astro import events
+
+        tz = ZoneInfo(place["tz"])
+        rows = []
+        for e in events(coords[0], coords[1], tz, now, now + timedelta(hours=hours), planets=settings["planets"],
+                        stars=settings["stars"]):
+            data = {**e.data, "city": place["city"], "tz": place["tz"], "local_time": e.at.astimezone(tz).isoformat()}
+            rows.append((e.body, e.kind, e.at.astimezone(tz).date(), e.at, e.alt, f"{e.text} {place['city']}.",
+                         json.dumps(data, ensure_ascii=False)))
+        return self.store.add_astro(person, place["id"], rows)
+
+    def _replan_sky(self, person: str) -> None:
+        """Место или настройки изменились: прежние планы — в пропуск, новые — сразу (ошибка не мешает ответу)."""
+        try:
+            self.store.skip_pending_astro(person)
+            self.plan_sky(person)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("copilot1c.secretary").exception("планирование неба")
+
+    def deliver_sky(self, late_minutes: int = 30) -> list[dict]:
+        """События неба, время которых пришло: тихое сообщение. Опоздавшие (ядро было остановлено), события
+        прежнего места и выключенные настройками — пропускаются."""
+        now = self.now()
+        out = []
+        for ev in self.store.due_astro(now):
+            st = self.store.settings(ev["person"])
+            kind = (ev["data"] or {}).get("kind")
+            off = not st["astro"] or (kind == "planet" and not st["planets"]) or (kind == "star" and not st["stars"])
+            place = self.place(ev["person"], ev["at"])
+            if off or (now - ev["at"]).total_seconds() > late_minutes * 60 or not place or place["id"] != ev["place_id"]:
+                self.store.mark_astro(ev["id"], "skipped")
+                continue
+            out.append(self.store.add_notice(ev["person"], "astro", ev["text"],
+                                             {**(ev["data"] or {}), "body": ev["body"], "event": ev["kind"],
+                                              "alt": ev["alt"], "at": ev["at"].isoformat()}))
+            self.store.mark_astro(ev["id"], "sent")
+        return out
+
+    def _do_sky_set(self, person, cmd, said):
+        target, mode = cmd.notes[0], cmd.notes[1] == "on"
+        st = self.store.set_settings(person, **{target: mode})
+        if target == "astro" and mode and not (st["planets"] or st["stars"]):
+            st = self.store.set_settings(person, planets=True, stars=True)
+        self._replan_sky(person)
+        what = {"astro": "Сообщения о небе", "planets": "Кульминации планет", "stars": "Кульминации звёзд"}[target]
+        now_on = "включены" if mode else "выключены"
+        tail = "" if st["astro"] else " (небо целиком выключено — «включи небо»)"
+        return f"{what} {now_on}.{tail}", {"action": "sky_set", "settings": {k: st[k] for k in ("astro", "planets",
+                                                                                                  "stars")}}
+
     # ---------- окончание сессии (таймер) ----------
 
     def compose_end(self, session: dict, now: datetime | None = None) -> tuple[str, dict]:
@@ -560,7 +654,7 @@ class Secretary:
             "upcoming": [_place_out(u) for u in self.store.upcoming(person, now)],
             "session": _session_out(run, now) if run else None,
             "today": self._today(person, local),
-            "unread": [_notice_out(n) for n in self.store.notices(person, unread=True)],
+            "unread": self._unread(person, now),
             "books": [r for r in self.books_table(person) if r["status"] == "reading"],
         }
 
