@@ -107,7 +107,9 @@ def _title_ref(text: str) -> str | None:
 # оглавления), дальше «Предисловие<Tab>стр. 5», «1. Начало стр. 10», «Установка ……… 39».
 
 _PROGRESS_WORDS = re.compile(r"остановил\w*|чита\w*|прочит\w*|дочит\w*|текущ\w*|сейчас|закончил\w*|дошёл|дошел|"
-                             r"дошла|я\s+на|на\s*$", re.IGNORECASE)
+                             r"дошла|я\s+на|на\s*$|^(?:сегодня|вчера|утром|днём|днем|вечером|ночью)$", re.IGNORECASE)
+# Перед «Книга N» в строке оглавления допускается только пояснение: «Запиши оглавление:», «Раздел:», «Добавь главу —»
+_TOC_PREFIX = re.compile(r"^(?:\w+\s+){0,2}(?:оглавлени\w*|содержани\w*|раздел\w*|глав\w*)\s*[:\-—–]?\s*$", re.IGNORECASE)
 _TOC_WORD = re.compile(r"оглавлени\w*|содержани\w*|разделы|главы", re.IGNORECASE)
 _PAGE_WORD = r"(?:стр\.?|страниц\w*|с\.)"
 _TOC_LINE = re.compile(rf"^\s*(?P<title>\S.*?)[\s\t.…·_—–\-]*{_PAGE_WORD}?\s*(?P<page>\d{{1,5}})\s*$", re.IGNORECASE)
@@ -125,10 +127,17 @@ def toc_entry(line: str) -> tuple[str, int] | None:
     """«Книга 1, стр. 5, Предисловие» → («Предисловие», 5); строка-отметка («остановился на стр. 15») → None."""
     t = " ".join(line.split())
     ref = _REF.search(t)
-    if not ref or t[: ref.start()].strip():  # строка оглавления начинается с «Книга N»; «вернулся к книге 2…» — отметка
+    if not ref:
+        return None
+    before = t[: ref.start()].strip()
+    if before and not _TOC_PREFIX.match(before):  # «вернулся к книге 2, страница 160» — отметка, не оглавление
         return None
     rest = t[ref.end():].strip(" ,.;:—–-")
-    m = _TOC_LINE_PAGE_FIRST.match(rest)
+    rest = re.sub(r"^(?:оглавлени\w*|содержани\w*)\s*[:\-—–]?\s*", "", rest, flags=re.IGNORECASE)  # «Книга 1, оглавление: …»
+    # «стр. 5, Предисловие», «стр.5 Предисловие» (без запятой — название начинается с буквы или «1.»)
+    m = _TOC_LINE_PAGE_FIRST.match(rest) or re.match(
+        rf"^{_PAGE_WORD}\s*(?P<page>\d{{1,5}})\s+(?P<title>(?:\d{{1,3}}[.)]\s*)?[A-Za-zА-Яа-яЁё«\"„].*?)\s*$", rest,
+        re.IGNORECASE)
     if m:
         title, page = m.group("title"), int(m.group("page"))
     else:
@@ -196,9 +205,11 @@ def parse_book(text: str) -> Command | None:
         return Command("book_done", book_no=_ref(t), book_ref=None if _ref(t) else _title_ref(t))
     if _PAUSE.search(t):
         return Command("book_pause", book_no=_ref(t), book_ref=None if _ref(t) else _title_ref(t))
-    if re.search(r"(?:удал\w*|убер\w*|отмен\w*|сотри)\s+(?:последн\w*\s+|ошибочн\w*\s+)?(?:отметк\w*|запис\w*)", t,
-                 re.IGNORECASE):  # «удали последнюю отметку книги 1», «удали отметку стр. 5 в книге 1»
-        return Command("book_mark_delete", book_no=_ref(t), page=_page(t))
+    # «удали последнюю отметку книги 1», «удали (все) отметки стр. 5 в книге 1»
+    if re.search(r"(?:удал\w*|убер\w*|отмен\w*|сотри)\s+(?:вс[еёи]\s+)?(?:последн\w*\s+|ошибочн\w*\s+)?"
+                 r"(?:отметк\w*|запис\w*)", t, re.IGNORECASE):
+        return Command("book_mark_delete", book_no=_ref(t), page=_page(t),
+                       notes=["all"] if re.search(r"(?<![\wё])вс[еёи]\w*", t, re.IGNORECASE) else [])
     if _TOC_WORD.search(t) and _ref(t) is not None and _page(t) is None:  # «оглавление книги 1»
         return Command("book_toc_show", book_no=_ref(t))
     m = re.search(rf"(?:удал\w*|убер\w*)\s+(?:из\s+оглавления\s+)?(?:раздел\w*|глав\w*)\s+[«\"„]?(?P<t>[^»\"“]+?)[»\"“]?\s*"

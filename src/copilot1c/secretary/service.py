@@ -386,6 +386,16 @@ class Secretary:
         b, why = self._find_book(person, cmd)
         if b is None:
             return why, {"action": "book_mark_delete", "ok": False}
+        if "all" in cmd.notes:
+            gone = self.store.delete_readings(b["id"], cmd.page)
+            what = f"со страницей {cmd.page}" if cmd.page is not None else ""
+            if not gone:
+                return (f"У книги № {b['num']} нет отметок {what}".rstrip() + ".",
+                        {"action": "book_mark_delete", "ok": False})
+            log = self.store.reading_log(person, [b["id"]])
+            now = f" Теперь: стр. {log[-1]['page']}." if log else " Отметок больше нет."
+            return (f"Удалил отметки книги № {b['num']} {what}: {len(gone)}.".replace("  ", " ") + now,
+                    {"action": "book_mark_delete", "ok": True, "deleted": len(gone)})
         r = self.store.delete_reading(b["id"], cmd.page)
         if r is None:
             what = f"со страницей {cmd.page}" if cmd.page is not None else ""

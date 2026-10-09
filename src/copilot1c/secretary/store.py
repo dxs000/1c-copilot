@@ -198,6 +198,12 @@ class SecretaryStore:
         return self._one(f"""DELETE FROM sec_reading WHERE id = (SELECT id FROM sec_reading WHERE book_id = %s {cond}
                                                              ORDER BY at DESC, id DESC LIMIT 1) RETURNING *""", params)
 
+    def delete_readings(self, book_id: int, page: int | None) -> list[dict]:
+        """Все отметки книги с этой страницей (или вообще все, если страница не названа)."""
+        if page is None:
+            return self._rows("DELETE FROM sec_reading WHERE book_id = %s RETURNING *", (book_id,))
+        return self._rows("DELETE FROM sec_reading WHERE book_id = %s AND page = %s RETURNING *", (book_id, page))
+
     def upsert_toc(self, book_id: int, entries: list[tuple[str, int]]) -> tuple[int, int]:
         """(добавлено, обновлено) — раздел с тем же названием получает новую страницу."""
         added = updated = 0

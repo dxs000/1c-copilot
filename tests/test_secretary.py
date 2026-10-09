@@ -509,3 +509,31 @@ def test_delete_wrong_mark(sec):
     assert [e["page"] for e in sec.book_history("ivan", sec.books_table("ivan")[0]["id"])["entries"]] == [15]
     assert "нет отметок со страницей 5" in sec.say("ivan", "удали отметку стр. 5 в книге 1")["reply"]
     assert "Отметок больше нет" in sec.say("ivan", "удали последнюю отметку книги 1")["reply"]
+
+
+def test_toc_phrasings_from_real_use():
+    for text in ["Книга 1, стр. 5, Предисловие", "Книга №1 стр.5 Предисловие",
+                 "Запиши оглавление: Книга N1, стр. 5, Предисловие", "Книга 1, оглавление: стр. 5, Предисловие",
+                 "Добавь раздел: Книга 1, стр. 5, Предисловие"]:
+        c = _one(text)
+        assert (c.action, c.book_no, c.toc) == ("book_toc", 1, [("Предисловие", 5)]), text
+    assert _one("Книга №1 стр.10 1. Начало").toc == [("1. Начало", 10)]
+    for text, page in [("Книга №1 стр.15", 15), ("Книга 1 стр 70 сегодня", 70), ("вернулся к книге 2, страница 160", 160),
+                       ("Книга 1, остановился на стр. 15", 15)]:
+        c = _one(text)
+        assert (c.action, c.page) == ("book_page", page), text
+    c = _one("удали все отметки стр. 5 в книге 1")
+    assert (c.action, c.page, c.notes) == ("book_mark_delete", 5, ["all"])
+
+
+@needs_pg
+def test_delete_all_wrong_marks(sec):
+    sec.say("ivan", "я в Брянске")
+    sec.say("ivan", "зарегистрируй книгу Максим Радченко «1С: Программирование для начинающих»")
+    for _ in range(3):  # как записала прежняя версия
+        sec.say("ivan", "книга 1 стр 5")
+    sec.say("ivan", "Книга 1, остановился на стр. 15")
+    r = sec.say("ivan", "удали все отметки стр. 5 в книге 1")["reply"]
+    assert r == "Удалил отметки книги № 1 со страницей 5: 3. Теперь: стр. 15."
+    assert "«Предисловие» — стр. 5" in sec.say("ivan", "Книга №1 стр.5 Предисловие")["reply"]
+    assert [e["page"] for e in sec.book_history("ivan", sec.books_table("ivan")[0]["id"])["entries"]] == [15]
