@@ -100,9 +100,89 @@ def _title_ref(text: str) -> str | None:
     return m.group("t").strip() if m else None
 
 
+# ---------- оглавление ----------
+# «Книга 1, стр. 5, Предисловие» — строка оглавления (после страницы — название раздела), а не отметка чтения.
+# Отметка — когда вместо названия слова чтения: «Книга 1, остановился на стр. 15», «читаю книгу 1, стр. 70».
+# Оглавление можно вставить списком: первая строка «Книга 1» (или «Книга 1, оглавление:», или сама строка
+# оглавления), дальше «Предисловие<Tab>стр. 5», «1. Начало стр. 10», «Установка ……… 39».
+
+_PROGRESS_WORDS = re.compile(r"остановил\w*|чита\w*|прочит\w*|дочит\w*|текущ\w*|сейчас|закончил\w*|дошёл|дошел|"
+                             r"дошла|я\s+на|на\s*$", re.IGNORECASE)
+_TOC_WORD = re.compile(r"оглавлени\w*|содержани\w*|разделы|главы", re.IGNORECASE)
+_PAGE_WORD = r"(?:стр\.?|страниц\w*|с\.)"
+_TOC_LINE = re.compile(rf"^\s*(?P<title>\S.*?)[\s\t.…·_—–\-]*{_PAGE_WORD}?\s*(?P<page>\d{{1,5}})\s*$", re.IGNORECASE)
+_TOC_LINE_PAGE_FIRST = re.compile(rf"^\s*{_PAGE_WORD}\s*(?P<page>\d{{1,5}})\s*[,.:;—–\-\t]+\s*(?P<title>\S.*?)\s*$",
+                                  re.IGNORECASE)
+_REF_ONLY = re.compile(rf"^\s*{_BOOK_WORD}\s*(?:номер|№|#)?\s*\d{{1,4}}\s*[,.:;—–\-]*\s*(?:оглавлени\w*|содержани\w*)?"
+                       r"\s*[:.]?\s*$", re.IGNORECASE)
+
+
+def _clean_title(s: str) -> str:
+    return " ".join(s.strip(" \t,.;:—–-…·_").split())
+
+
+def toc_entry(line: str) -> tuple[str, int] | None:
+    """«Книга 1, стр. 5, Предисловие» → («Предисловие», 5); строка-отметка («остановился на стр. 15») → None."""
+    t = " ".join(line.split())
+    ref = _REF.search(t)
+    if not ref or t[: ref.start()].strip():  # строка оглавления начинается с «Книга N»; «вернулся к книге 2…» — отметка
+        return None
+    rest = t[ref.end():].strip(" ,.;:—–-")
+    m = _TOC_LINE_PAGE_FIRST.match(rest)
+    if m:
+        title, page = m.group("title"), int(m.group("page"))
+    else:
+        m = re.match(rf"^(?P<title>.+?)\s*[,.:;—–\-]\s*{_PAGE_WORD}\s*(?P<page>\d{{1,5}})\s*$", rest, re.IGNORECASE)
+        if not m:
+            return None
+        title, page = m.group("title"), int(m.group("page"))
+    title = _clean_title(title)
+    if not title or _PROGRESS_WORDS.search(title) or not re.search(r"[A-Za-zА-Яа-яЁё]", title):
+        return None
+    return title, page
+
+
+def parse_toc_lines(lines: list[str]) -> list[tuple[str, int]]:
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        m = _TOC_LINE_PAGE_FIRST.match(ln) or _TOC_LINE.match(ln.replace("\t", " \t "))
+        if not m:
+            return []  # не похоже на оглавление целиком — не гадаем
+        title = _clean_title(m.group("title"))
+        if not title or not re.search(r"[A-Za-zА-Яа-яЁё]", title):
+            return []
+        out.append((title, int(m.group("page"))))
+    return out
+
+
+def _parse_toc_block(text: str) -> Command | None:
+    lines = [ln for ln in text.replace("\r", "").split("\n") if ln.strip()]
+    if len(lines) < 2:
+        return None
+    first = lines[0]
+    no = _ref(first)
+    if no is None:
+        return None
+    entries: list[tuple[str, int]] = []
+    head = toc_entry(first)
+    if head:
+        entries.append(head)
+    elif not _REF_ONLY.match(first):
+        return None
+    rest = parse_toc_lines(lines[1:])
+    if not rest:
+        return None
+    return Command("book_toc", book_no=no, toc=entries + rest)
+
+
 def parse_book(text: str) -> Command | None:
     """Команда про книги или None — фраза не о книгах."""
-    t = " ".join(text.split())
+    block = _parse_toc_block(text or "")
+    if block is not None:
+        return block
+    t = " ".join((text or "").split())
     m = _ADD.search(t)
     if m and not _ref(m.group("rest")[:12]):  # «добавь книге 1 страницу…» — не регистрация
         author, title, pages = split_author_title(m.group("rest"))
@@ -116,6 +196,19 @@ def parse_book(text: str) -> Command | None:
         return Command("book_done", book_no=_ref(t), book_ref=None if _ref(t) else _title_ref(t))
     if _PAUSE.search(t):
         return Command("book_pause", book_no=_ref(t), book_ref=None if _ref(t) else _title_ref(t))
+    if re.search(r"(?:удал\w*|убер\w*|отмен\w*|сотри)\s+(?:последн\w*\s+|ошибочн\w*\s+)?(?:отметк\w*|запис\w*)", t,
+                 re.IGNORECASE):  # «удали последнюю отметку книги 1», «удали отметку стр. 5 в книге 1»
+        return Command("book_mark_delete", book_no=_ref(t), page=_page(t))
+    if _TOC_WORD.search(t) and _ref(t) is not None and _page(t) is None:  # «оглавление книги 1»
+        return Command("book_toc_show", book_no=_ref(t))
+    m = re.search(rf"(?:удал\w*|убер\w*)\s+(?:из\s+оглавления\s+)?(?:раздел\w*|глав\w*)\s+[«\"„]?(?P<t>[^»\"“]+?)[»\"“]?\s*"
+                  rf"(?:(?:из|в|у)\s+{_BOOK_WORD}\s*(?:№\s*)?\d+)?\s*$", t, re.IGNORECASE)
+    if m and _ref(t) is not None:
+        return Command("book_toc_delete", book_no=_ref(t), title=_clean_title(re.sub(rf"(?:из|в|у)\s+{_BOOK_WORD}.*$", "",
+                                                                                      m.group("t"))))
+    entry = toc_entry(t)
+    if entry is not None:
+        return Command("book_toc", book_no=_ref(t), toc=[entry])
     total = _TOTAL.search(t)
     if total:  # «в книге 1 всего 1300 страниц», «объём 1300 стр.», «в книге 2 640 страниц»
         return Command("book_total", book_no=_ref(t), total_pages=int(total.group(1)))
@@ -130,6 +223,17 @@ def parse_book(text: str) -> Command | None:
 
 
 # ---------- статистика для таблицы ----------
+
+def section_at(toc: list[dict], page: int | None) -> dict | None:
+    """Раздел, в котором страница: последний раздел оглавления, начавшийся не позже неё."""
+    if page is None:
+        return None
+    cur = None
+    for e in sorted(toc, key=lambda e: (e["page"], e["id"])):
+        if e["page"] <= page:
+            cur = e
+    return cur
+
 
 def book_label(b: dict) -> str:
     who = f"{b['author']} " if b.get("author") else ""

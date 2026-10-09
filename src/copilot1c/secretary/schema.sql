@@ -85,3 +85,15 @@ CREATE TABLE IF NOT EXISTS sec_reading (
     said     text
 );
 CREATE INDEX IF NOT EXISTS sec_reading_book_idx ON sec_reading (book_id, at);
+
+-- Оглавление книги: раздел и страница, с которой он начинается («Книга 1, стр. 5, Предисловие»). Раздел с тем же
+-- названием перезаписывается новой страницей.
+CREATE TABLE IF NOT EXISTS sec_book_toc (
+    id          bigserial PRIMARY KEY,
+    book_id     bigint NOT NULL REFERENCES sec_books(id) ON DELETE CASCADE,
+    title       text NOT NULL,
+    page        int NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (book_id, title)
+);
+CREATE INDEX IF NOT EXISTS sec_book_toc_page_idx ON sec_book_toc (book_id, page);

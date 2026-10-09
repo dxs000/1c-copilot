@@ -201,6 +201,7 @@ class Command:
     author: str | None = None
     title: str | None = None
     total_pages: int | None = None
+    toc: list[tuple[str, int]] = field(default_factory=list)  # оглавление: (раздел, страница)
 
 
 def _place_after(text: str, start: int) -> str | None:
@@ -261,7 +262,8 @@ def parse(text: str, today: date) -> list[Command]:
         return [Command("help")]
     from copilot1c.secretary.books import parse_book
 
-    book = parse_book(t)  # раньше остальных: «закончил книгу» — не «стоп», «вернулся к книге» — не переезд
+    # исходный текст: оглавление — по строкам; книги — раньше остальных («закончил книгу» — не «стоп»)
+    book = parse_book(text)
     if book is not None:
         return [book]
     if _HISTORY.search(t):

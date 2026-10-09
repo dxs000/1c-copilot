@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from copilot1c.secretary.books import book_label, stats
+from copilot1c.secretary.books import book_label, section_at, stats
 from copilot1c.secretary.parse import Command, parse
 from copilot1c.secretary.places import NotAPlace, resolve
 from copilot1c.secretary.store import SecretaryStore
@@ -28,7 +28,10 @@ HELP = ("Я веду ваш распорядок.\n"
         "• Сессии: «работаем час», «работаю до 18:00», «перерыв 15 минут», «сколько осталось», «стоп».\n"
         "• «Где я» — место, местное время и погода сейчас.\n"
         "• Книги: «зарегистрируй книгу Л.Н. Толстой „Война и мир“», «читаю книгу № 1, страница 70», «в книге 1 "
-        "всего 1300 страниц», «дочитал книгу 1», «отложил книгу 2», «мои книги». Таблица — на странице «Книги».\n"
+        "всего 1300 страниц», «дочитал книгу 1», «отложил книгу 2», «мои книги».\n"
+        "• Оглавление: «Книга 1, стр. 5, Предисловие» или списком; "
+        "отметка, где остановились: «Книга 1, остановился на стр. 15»; ошибочную — «удали последнюю отметку книги 1». "
+        "Таблица — на странице «Книги».\n"
         "По окончании сессии напишу точное местное время и погоду там, где вы находитесь.")
 
 
@@ -335,6 +338,9 @@ class Secretary:
         parts = [f"Книга {book_label(b)}: стр. {cmd.page}"]
         if b["total_pages"]:
             parts[0] += f" из {b['total_pages']} ({round(min(cmd.page / b['total_pages'], 1) * 100)} %)"
+        sec = section_at(self.store.toc([b["id"]]), cmd.page)
+        if sec:
+            parts[0] += f", раздел «{sec['title']}» (с стр. {sec['page']})"
         if prev:
             delta = cmd.page - prev["page"]
             when = prev["at"].astimezone(ZoneInfo(prev["tz"]) if _valid(prev.get("tz")) else local.tzinfo)
@@ -347,6 +353,65 @@ class Secretary:
         if b["total_pages"] and cmd.page >= b["total_pages"]:
             parts.append("похоже, дочитана — скажите «дочитал книгу " + str(b["num"]) + "»")
         return "; ".join(parts) + ".", {"action": "book_page", "ok": True, "book": _book_out(b), "page": cmd.page}
+
+    def _toc_text(self, b: dict, current: int | None = None) -> str:
+        toc = self.store.toc([b["id"]])
+        if not toc:
+            return "Оглавления нет. Добавьте: «Книга 1, стр. 5, Предисловие» или списком (первая строка «Книга 1»)."
+        here = section_at(toc, current)
+        lines = []
+        for e in toc:
+            mark = "  ← вы здесь" if here and e["id"] == here["id"] else ""
+            lines.append(f"• {e['title']} — стр. {e['page']}{mark}")
+        return "\n".join(lines)
+
+    def _do_book_toc(self, person, cmd, said):
+        b, why = self._find_book(person, cmd)
+        if b is None:
+            return why, {"action": "book_toc", "ok": False}
+        added, updated = self.store.upsert_toc(b["id"], cmd.toc)
+        if len(cmd.toc) == 1:
+            title, page = cmd.toc[0]
+            head = (f"Оглавление книги {book_label(b)}: «{title}» — стр. {page}"
+                    + (" (страница обновлена)" if updated else "") + ".")
+            n = len(self.store.toc([b["id"]]))
+            return head + f" Разделов в оглавлении: {n}.", {"action": "book_toc", "ok": True, "added": added,
+                                                              "updated": updated}
+        log = self.store.reading_log(person, [b["id"]])
+        what = f"добавил {added}" + (f", обновил {updated}" if updated else "")
+        return (f"Оглавление книги {book_label(b)}: {what}.\n" + self._toc_text(b, log[-1]["page"] if log else None),
+                {"action": "book_toc", "ok": True, "added": added, "updated": updated})
+
+    def _do_book_mark_delete(self, person, cmd, said):
+        b, why = self._find_book(person, cmd)
+        if b is None:
+            return why, {"action": "book_mark_delete", "ok": False}
+        r = self.store.delete_reading(b["id"], cmd.page)
+        if r is None:
+            what = f"со страницей {cmd.page}" if cmd.page is not None else ""
+            return f"У книги № {b['num']} нет отметок {what}".rstrip() + ".", {"action": "book_mark_delete", "ok": False}
+        tz = ZoneInfo(r["tz"]) if _valid(r.get("tz")) else self.host_tz()
+        log = self.store.reading_log(person, [b["id"]])
+        now = f" Теперь: стр. {log[-1]['page']}." if log else " Отметок больше нет."
+        return (f"Удалил отметку книги № {b['num']}: стр. {r['page']}, "
+                f"{r['at'].astimezone(tz).strftime('%d.%m.%Y %H:%M')}.{now}", {"action": "book_mark_delete", "ok": True})
+
+    def _do_book_toc_show(self, person, cmd, said):
+        b, why = self._find_book(person, cmd)
+        if b is None:
+            return why, {"action": "book_toc_show", "ok": False}
+        log = self.store.reading_log(person, [b["id"]])
+        return (f"Оглавление книги {book_label(b)}:\n" + self._toc_text(b, log[-1]["page"] if log else None),
+                {"action": "book_toc_show", "ok": True})
+
+    def _do_book_toc_delete(self, person, cmd, said):
+        b, why = self._find_book(person, cmd)
+        if b is None:
+            return why, {"action": "book_toc_delete", "ok": False}
+        n = self.store.delete_toc(b["id"], cmd.title or "")
+        if not n:
+            return f"В оглавлении книги № {b['num']} нет раздела «{cmd.title}».", {"action": "book_toc_delete", "ok": False}
+        return f"Убрал из оглавления книги № {b['num']}: «{cmd.title}».", {"action": "book_toc_delete", "ok": True}
 
     def _do_book_total(self, person, cmd, said):
         b, why = self._find_book(person, cmd)
@@ -392,10 +457,15 @@ class Secretary:
         now = self.now()
         books = self.store.books(person)
         log = self.store.reading_log(person, [b["id"] for b in books]) if books else []
+        toc = self.store.toc([b["id"] for b in books]) if books else []
         out = []
         for b in books:
             st = stats(b, [r for r in log if r["book_id"] == b["id"]], now)
             row = {**_book_out(b), **{k: _iso(v) for k, v in st.items()}}
+            book_toc = [e for e in toc if e["book_id"] == b["id"]]
+            sec = section_at(book_toc, st["page"])
+            row["section"] = sec["title"] if sec else None
+            row["toc_count"] = len(book_toc)
             if st["last_at"] is not None:
                 tz = ZoneInfo(st["last_tz"]) if _valid(st["last_tz"]) else self.host_tz()
                 row["last_text"] = st["last_at"].astimezone(tz).strftime("%d.%m.%Y %H:%M") + (
@@ -407,15 +477,22 @@ class Secretary:
         b = self.store.book_by_id(person, book_id)
         if b is None:
             return None
+        toc = self.store.toc([book_id])
         rows, prev = [], None
         for r in self.store.reading_log(person, [book_id]):
             tz = ZoneInfo(r["tz"]) if _valid(r.get("tz")) else self.host_tz()
             local = r["at"].astimezone(tz)
             rows.append({"id": r["id"], "at": _iso(r["at"]), "local_text": local.strftime("%d.%m.%Y %H:%M"),
                          "utc_offset": utc_offset(local), "page": r["page"], "city": r.get("city"),
-                         "delta": None if prev is None else r["page"] - prev})
+                         "delta": None if prev is None else r["page"] - prev,
+                         "section": (section_at(toc, r["page"]) or {}).get("title")})
             prev = r["page"]
-        return {"book": _book_out(b), "entries": list(reversed(rows))}
+        current = rows[-1]["page"] if rows else None
+        here = section_at(toc, current)
+        contents = [{"id": e["id"], "title": e["title"], "page": e["page"],
+                     "state": ("current" if here and e["id"] == here["id"] else
+                               "read" if current is not None and e["page"] <= current else "ahead")} for e in toc]
+        return {"book": _book_out(b), "entries": list(reversed(rows)), "toc": contents}
 
     # ---------- окончание сессии (таймер) ----------
 

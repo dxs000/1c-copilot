@@ -218,7 +218,8 @@ def sec():
     clock = Clock(datetime(2026, 10, 9, 5, 0, tzinfo=UTC))  # 07:00 в Варшаве (UTC+2)
     weather_calls = []
     sx = Secretary(g.conn, s, now=clock, weather=lambda c, k: weather_calls.append(c) or WEATHER)
-    for t in ("sec_notices", "sec_sessions", "sec_places", "sec_place_names", "sec_reading", "sec_books"):
+    for t in ("sec_notices", "sec_sessions", "sec_places", "sec_place_names", "sec_reading", "sec_book_toc",
+              "sec_books"):
         g.conn.execute(f"DELETE FROM {t}")
     g.conn.commit()
     sx.clock, sx.weather_calls = clock, weather_calls
@@ -438,3 +439,73 @@ def test_books_api():
     h = c.get(f"/secretary/books/{books[0]['id']}", params={"person": "Иван"}).json()
     assert h["entries"][0]["page"] == 70
     assert c.get(f"/secretary/books/{books[0]['id']}", params={"person": "Пётр"}).status_code == 404
+
+
+# ---------- оглавление и отметка «остановился» ----------
+
+TOC_PASTE = ("Книга 1\nПредисловие\tстр. 5\n1. Начало\tстр. 10\nПрограмма\tстр.18\nКак устроено 1С \tстр. 30\n"
+             "Зачем нужны прикладные решениея\tстр. 37\nУстановка\tстр. 39\nУстановка платформы\tстр. 49")
+
+
+def test_toc_vs_progress_phrases():
+    c = _one("Книга 1, стр. 5, Предисловие")
+    assert (c.action, c.book_no, c.toc) == ("book_toc", 1, [("Предисловие", 5)])
+    c = _one("Книга 1,  остановился на стр. 15")
+    assert (c.action, c.book_no, c.page) == ("book_page", 1, 15)
+    assert _one("книга 1, стр. 10, 1. Начало").toc == [("1. Начало", 10)]
+    assert _one("Книга 1, Программа — стр. 18").toc == [("Программа", 18)]
+    assert _one("Книга 1, я на стр. 40").action == "book_page"
+    assert _one("книга 1 стр 70").action == "book_page"  # без названия раздела — отметка, как раньше
+    c = _one(TOC_PASTE)
+    assert c.action == "book_toc" and len(c.toc) == 7 and c.toc[4] == ("Зачем нужны прикладные решениея", 37)
+    c = _one("Книга 1, стр. 5, Предисловие\n1. Начало стр. 10\nПрограмма ........ 18")
+    assert c.toc == [("Предисловие", 5), ("1. Начало", 10), ("Программа", 18)]
+    assert _one("Книга 1, оглавление:\nПредисловие 5\nГлава 2. Установка 39").toc[1] == ("Глава 2. Установка", 39)
+    assert _one("оглавление книги 1").action == "book_toc_show"
+    c = _one("удали раздел Программа из книги 1")
+    assert (c.action, c.book_no, c.title) == ("book_toc_delete", 1, "Программа")
+
+
+@needs_pg
+def test_toc_and_where_i_stopped(sec):
+    sec.say("ivan", "я в Брянске")
+    sec.say("ivan", "зарегистрируй книгу Хрусталева «1С: Предприятие 8.3. Практическое пособие разработчика»")
+    r = sec.say("ivan", "Книга 1, стр. 5, Предисловие")
+    assert "«Предисловие» — стр. 5" in r["reply"] and "Разделов в оглавлении: 1" in r["reply"]
+    assert sec.books_table("ivan")[0]["page"] is None  # строка оглавления — не отметка чтения
+    r = sec.say("ivan", TOC_PASTE)
+    assert "добавил 6, обновил 1" in r["reply"] and "• Установка платформы — стр. 49" in r["reply"]
+
+    r = sec.say("ivan", "Книга 1,  остановился на стр. 15")
+    assert "стр. 15, раздел «1. Начало» (с стр. 10)" in r["reply"] and "(Брянск)" in r["reply"]
+    sec.clock.tick(hours=2)
+    sec.say("ivan", "книга 1, остановился на стр. 33")
+    hist = sec.book_history("ivan", sec.books_table("ivan")[0]["id"])
+    first = hist["entries"][-1]
+    assert (first["local_text"], first["page"], first["delta"], first["city"]) == ("09.10.2026 08:00", 15, None, "Брянск")
+    assert first["utc_offset"] == "UTC+03:00" and first["section"] == "1. Начало"
+    assert hist["entries"][0]["delta"] == 18 and hist["entries"][0]["section"] == "Как устроено 1С"
+    states = {e["title"]: e["state"] for e in hist["toc"]}
+    assert states["Программа"] == "read" and states["Как устроено 1С"] == "current" and states["Установка"] == "ahead"
+    row = sec.books_table("ivan")[0]
+    assert row["section"] == "Как устроено 1С" and row["toc_count"] == 7
+    assert "← вы здесь" in sec.say("ivan", "оглавление книги 1")["reply"]
+    assert "Убрал" in sec.say("ivan", "удали раздел Программа из книги 1")["reply"]
+    assert len(sec.book_history("ivan", row["id"])["toc"]) == 6
+
+
+@needs_pg
+def test_delete_wrong_mark(sec):
+    assert _one("удали последнюю отметку книги 1").action == "book_mark_delete"
+    c = _one("удали отметку стр. 5 в книге 1")
+    assert (c.action, c.book_no, c.page) == ("book_mark_delete", 1, 5)
+    sec.say("ivan", "я в Брянске")
+    sec.say("ivan", "зарегистрируй книгу Хрусталева «Практическое пособие разработчика»")
+    sec.say("ivan", "книга 1 стр 5")  # как ошибочно записалось до оглавления
+    sec.clock.tick(minutes=5)
+    sec.say("ivan", "Книга 1, остановился на стр. 15")
+    r = sec.say("ivan", "удали отметку стр. 5 в книге 1")["reply"]
+    assert "Удалил отметку книги № 1: стр. 5, 09.10.2026 08:00. Теперь: стр. 15." == r
+    assert [e["page"] for e in sec.book_history("ivan", sec.books_table("ivan")[0]["id"])["entries"]] == [15]
+    assert "нет отметок со страницей 5" in sec.say("ivan", "удали отметку стр. 5 в книге 1")["reply"]
+    assert "Отметок больше нет" in sec.say("ivan", "удали последнюю отметку книги 1")["reply"]

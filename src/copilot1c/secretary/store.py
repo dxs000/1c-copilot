@@ -191,6 +191,39 @@ class SecretaryStore:
                               (person, book_ids))
         return self._rows("SELECT * FROM sec_reading WHERE person = %s ORDER BY at, id", (person,))
 
+    def delete_reading(self, book_id: int, page: int | None) -> dict | None:
+        """Последняя отметка книги (или последняя с этой страницей) — удалить; удалённая запись или None."""
+        cond = "AND page = %s" if page is not None else ""
+        params = (book_id, page) if page is not None else (book_id,)
+        return self._one(f"""DELETE FROM sec_reading WHERE id = (SELECT id FROM sec_reading WHERE book_id = %s {cond}
+                                                             ORDER BY at DESC, id DESC LIMIT 1) RETURNING *""", params)
+
+    def upsert_toc(self, book_id: int, entries: list[tuple[str, int]]) -> tuple[int, int]:
+        """(добавлено, обновлено) — раздел с тем же названием получает новую страницу."""
+        added = updated = 0
+        try:
+            with self.conn.cursor(row_factory=dict_row) as cur:
+                for title, page in entries:
+                    cur.execute("""INSERT INTO sec_book_toc (book_id, title, page) VALUES (%s,%s,%s)
+                                   ON CONFLICT (book_id, title) DO UPDATE SET page = EXCLUDED.page
+                                   RETURNING (xmax = 0) AS inserted""", (book_id, title, page))
+                    if cur.fetchone()["inserted"]:
+                        added += 1
+                    else:
+                        updated += 1
+            self.conn.commit()
+            return added, updated
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def toc(self, book_ids: list[int]) -> list[dict]:
+        return self._rows("SELECT * FROM sec_book_toc WHERE book_id = ANY(%s) ORDER BY book_id, page, id", (book_ids,))
+
+    def delete_toc(self, book_id: int, title: str) -> int:
+        return len(self._rows("DELETE FROM sec_book_toc WHERE book_id = %s AND lower(title) = lower(%s) RETURNING id",
+                              (book_id, title)))
+
     # ---------- сообщения ----------
 
     def notices(self, person: str, after_id: int = 0, unread: bool = False, limit: int = 50) -> list[dict]:
