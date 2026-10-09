@@ -1,0 +1,426 @@
+"""Секретарь: фраза → действие → ответ; состояние для панели «Сейчас»; сообщение об окончании сессии.
+
+Фразы сначала разбирают правила (parse.py), непонятое — модель COPILOT_MODEL_BATCH (если COPILOT_SECRETARY_LLM).
+Город, пояс — places.py; погода — weather.py (Yandex Search API + модель). Все записи — store.py.
+Время — всегда по часовому поясу текущего места; место не указано — по поясу сервера.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from copilot1c.secretary.parse import Command, parse
+from copilot1c.secretary.places import NotAPlace, resolve
+from copilot1c.secretary.store import SecretaryStore
+
+WEEKDAY_NAMES = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+MONTH_NAMES = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
+               "ноября", "декабря"]
+LATE_SECONDS = 90  # сообщение пришло позже окончания больше чем на столько — сказать об этом
+
+HELP = ("Я веду ваш распорядок.\n"
+        "• Место: «я в Варшаве», «завтра еду в Лондон», «вернулся в Варшаву», «не еду» (отменить поездку), "
+        "«где я был».\n"
+        "• Сессии: «работаем час», «работаю до 18:00», «перерыв 15 минут», «сколько осталось», «стоп».\n"
+        "• «Где я» — место, местное время и погода сейчас.\n"
+        "По окончании сессии напишу точное местное время и погоду там, где вы находитесь.")
+
+
+def fmt_minutes(m: int) -> str:
+    h, mi = divmod(max(int(m), 0), 60)
+    if h and mi:
+        return f"{h} ч {mi} мин"
+    return f"{h} ч" if h else f"{mi} мин"
+
+
+def utc_offset(dt: datetime) -> str:
+    z = dt.strftime("%z") or "+0000"
+    return f"UTC{z[0]}{z[1:3]}:{z[3:5]}"
+
+
+def fmt_day(d: date) -> str:
+    return f"{WEEKDAY_NAMES[d.weekday()]}, {d.day} {MONTH_NAMES[d.month - 1]}"
+
+
+def fmt_from(d: date) -> str:
+    """«10 октября (суббота)» — для «с …»."""
+    return f"{d.day} {MONTH_NAMES[d.month - 1]} ({WEEKDAY_NAMES[d.weekday()]})"
+
+
+def move_day(p: dict) -> date:
+    """День переезда: как его назвали; иначе — дата начала по поясу города."""
+    return p.get("on_date") or p["effective_at"].astimezone(ZoneInfo(p["tz"])).date()
+
+
+def fmt_local(dt: datetime, seconds: bool = False) -> str:
+    """«15:32, пятница, 9 октября (UTC+02:00)»."""
+    return f"{dt.strftime('%H:%M:%S' if seconds else '%H:%M')}, {fmt_day(dt.date())} ({utc_offset(dt)})"
+
+
+def _iso(v: Any) -> Any:
+    return v.isoformat() if isinstance(v, datetime | date) else v
+
+
+class Secretary:
+    def __init__(self, conn, settings, now: Callable[[], datetime] | None = None,
+                 weather: Callable[[str, str], dict] | None = None, llm_parse: Callable[[str, date], list] | None = None):
+        self.store = SecretaryStore(conn)
+        self.s = settings
+        self._now = now or (lambda: datetime.now(UTC))
+        self._weather = weather
+        self._llm_parse = llm_parse
+
+    # ---------- время и место ----------
+
+    def now(self) -> datetime:
+        return self._now().astimezone(UTC)
+
+    def host_tz(self) -> tzinfo:
+        name = getattr(self.s, "secretary_default_tz", "") or ""
+        return ZoneInfo(name) if name else datetime.now().astimezone().tzinfo
+
+    def place(self, person: str, at: datetime | None = None) -> dict | None:
+        return self.store.place_at(person, at or self.now())
+
+    def tz_of(self, place: dict | None) -> tzinfo:
+        return ZoneInfo(place["tz"]) if place else self.host_tz()
+
+    def local(self, person: str, at: datetime | None = None) -> tuple[datetime, dict | None]:
+        at = at or self.now()
+        p = self.place(person, at)
+        return at.astimezone(self.tz_of(p)), p
+
+    def weather(self, place: dict | None) -> dict:
+        if place is None:
+            return {"ok": False, "reason": "место не указано"}
+        if self._weather is not None:
+            return self._weather(place["city"], place["country"])
+        from copilot1c.secretary.weather import current_weather
+
+        return current_weather(place["city"], place["country"], self.s)
+
+    # ---------- фраза ----------
+
+    def say(self, person: str, text: str) -> dict[str, Any]:
+        person = (person or "").strip()
+        local_now, _ = self.local(person)
+        commands = parse(text, local_now.date())
+        via = "rules"
+        if not commands and getattr(self.s, "secretary_llm", True):
+            commands = self._model_commands(text, local_now.date())
+            via = "model" if commands else via
+        if not commands:
+            return {"reply": "Не понял. " + HELP, "actions": [], "via": via, "state": self.state(person)}
+        replies, actions = [], []
+        for cmd in commands:
+            reply, action = self._run(person, cmd, text)
+            replies.append(reply)
+            actions.append(action)
+        return {"reply": "\n\n".join(replies), "actions": actions, "via": via, "state": self.state(person)}
+
+    def _model_commands(self, text: str, today: date) -> list[Command]:
+        if self._llm_parse is not None:
+            return self._llm_parse(text, today)
+        if not (self.s.yc_api_key and self.s.yc_folder_id):
+            return []
+        try:
+            return model_parse(text, today, self.s)
+        except Exception:  # noqa: BLE001 — модель недоступна: ответим подсказкой
+            import logging
+
+            logging.getLogger("copilot1c.secretary").exception("разбор фразы моделью")
+            return []
+
+    def _run(self, person: str, cmd: Command, said: str) -> tuple[str, dict]:
+        fn = getattr(self, f"_do_{cmd.action}", None)
+        if fn is None:
+            return HELP, {"action": "help"}
+        return fn(person, cmd, said)
+
+    def _do_help(self, person, cmd, said):
+        return HELP, {"action": "help"}
+
+    def _do_place(self, person: str, cmd: Command, said: str) -> tuple[str, dict]:
+        try:
+            place = resolve(cmd.place or "", self.s, cache=self.store)
+        except NotAPlace as exc:
+            return f"Не записал место: {exc}. Назовите город — например, «я в Варшаве».", \
+                {"action": "place", "ok": False, "said": cmd.place}
+        now = self.now()
+        current = self.place(person, now)
+        tz = ZoneInfo(place.tz)
+        local_today = now.astimezone(self.tz_of(current)).date()
+        if cmd.when and cmd.when > local_today:
+            # переезд в будущем: с начала того дня по часовому поясу, где человек будет до отъезда
+            start = datetime.combine(cmd.when, time(0, 0), tzinfo=self.tz_of(current))
+            row = self.store.add_place(person, place, start.astimezone(UTC), cmd.direction or "depart", said,
+                                       on_date=cmd.when)
+            here = f"Сейчас вы в городе {current['city']}." if current else "Где вы сейчас, не записано."
+            return (f"Записал: с {fmt_from(cmd.when)} — {place.city} ({place.country}, "
+                    f"{utc_offset(datetime.combine(cmd.when, time(12), tzinfo=tz))}). {here}",
+                    {"action": "place", "ok": True, "planned": True, "place": _place_out(row)})
+        # сейчас: та же запланированная поездка состоялась раньше — убрать план
+        for up in self.store.upcoming(person, now):
+            if up["city"] == place.city:
+                self.store._rows("UPDATE sec_places SET cancelled = true WHERE id = %s", (up["id"],))
+        if current and current["city"] == place.city:
+            local = now.astimezone(tz)
+            return (f"Уже записано: вы в городе {place.city} с {_since(current, tz)}. Местное время {fmt_local(local)}."
+                    + self._plans_hint(person, now), {"action": "place", "ok": True, "unchanged": True,
+                                                       "place": _place_out(current)})
+        row = self.store.add_place(person, place, now, cmd.direction or "arrive", said)
+        local = now.astimezone(tz)
+        was = f" До этого: {current['city']}." if current else ""
+        return (f"Записал: вы в городе {place.city} ({place.country}). Местное время {fmt_local(local)}.{was}"
+                + self._plans_hint(person, now), {"action": "place", "ok": True, "place": _place_out(row)})
+
+    def _plans_hint(self, person: str, now: datetime) -> str:
+        ups = self.store.upcoming(person, now)
+        if not ups:
+            return ""
+        items = "; ".join(f"с {fmt_from(move_day(u))} — {u['city']}"
+                          for u in ups[:3])
+        return f"\nЗапланировано: {items}. Отменить — «не еду»."
+
+    def _do_cancel_trip(self, person, cmd, said):
+        rows = self.store.cancel_upcoming(person, self.now())
+        if not rows:
+            return "Запланированных поездок нет.", {"action": "cancel_trip", "cancelled": 0}
+        return "Отменил: " + "; ".join(r["city"] for r in rows) + ".", {"action": "cancel_trip", "cancelled": len(rows)}
+
+    def _do_history(self, person, cmd, said):
+        now = self.now()
+        rows = self.store.history(person, 30)
+        if not rows:
+            return "Мест пока нет. Скажите, где вы: «я в Варшаве».", {"action": "history"}
+        lines = []
+        for r in rows:
+            mark = " (план)" if r["effective_at"] > now else ""
+            when = (r["on_date"].strftime("%d.%m.%Y") if r.get("on_date")  # переезд «на день» — без часов
+                    else r["effective_at"].astimezone(ZoneInfo(r["tz"])).strftime("%d.%m.%Y %H:%M"))
+            lines.append(f"• {when} — {r['city']}{mark}")
+        return "Места (новые сверху):\n" + "\n".join(lines[:15]), {"action": "history"}
+
+    def _do_work(self, person, cmd, said):
+        return self._start(person, "work", cmd, said)
+
+    def _do_rest(self, person, cmd, said):
+        return self._start(person, "rest", cmd, said)
+
+    def _start(self, person: str, kind: str, cmd: Command, said: str) -> tuple[str, dict]:
+        now = self.now()
+        local, place = self.local(person, now)
+        what = "работаем" if kind == "work" else "отдыхаем"
+        minutes = cmd.minutes
+        if cmd.until is not None:
+            end_local = datetime.combine(local.date(), cmd.until, tzinfo=local.tzinfo)
+            if end_local <= local:
+                return (f"{cmd.until.strftime('%H:%M')} по местному времени уже прошло (сейчас {local.strftime('%H:%M')}).",
+                        {"action": kind, "ok": False})
+            minutes = max(1, int(round((end_local - local).total_seconds() / 60)))
+        if not minutes:
+            return (f"Сколько {what}? Например: «{'работаем час' if kind == 'work' else 'перерыв 15 минут'}» или "
+                    f"«{'работаю' if kind == 'work' else 'отдыхаю'} до 18:00».", {"action": kind, "ok": False})
+        ends = now + timedelta(minutes=minutes)
+        new, replaced = self.store.start(person, kind, minutes, now, ends, said)
+        title = "Работаем" if kind == "work" else "Перерыв"
+        text = f"{title} {fmt_minutes(minutes)} — до {ends.astimezone(local.tzinfo).strftime('%H:%M')}"
+        text += f" ({place['city']}, {utc_offset(local)})." if place else f" (время сервера, {utc_offset(local)})."
+        text += " Напишу, когда закончится."
+        if replaced:
+            done = int((now - replaced["started_at"]).total_seconds() // 60)
+            text += (f"\nПредыдущую сессию ({'работа' if replaced['kind'] == 'work' else 'перерыв'}, "
+                     f"{fmt_minutes(replaced['minutes'])}) остановил через {fmt_minutes(done)}.")
+        if not place:
+            text += "\nГде вы? Скажите «я в …» — время и погода будут по вашему городу."
+        return text, {"action": kind, "ok": True, "session": _session_out(new, now)}
+
+    def _do_stop(self, person, cmd, said):
+        now = self.now()
+        row = self.store.stop(person, now)
+        if row is None:
+            return "Сейчас таймер не идёт.", {"action": "stop", "ok": False}
+        done = int((now - row["started_at"]).total_seconds() // 60)
+        what = "работу" if row["kind"] == "work" else "перерыв"
+        local, _ = self.local(person, now)
+        return (f"Остановил {what}: прошло {fmt_minutes(done)} из {fmt_minutes(row['minutes'])}. "
+                f"Местное время {local.strftime('%H:%M')}.", {"action": "stop", "ok": True})
+
+    def _do_status(self, person, cmd, said):
+        now = self.now()
+        local, place = self.local(person, now)
+        run = self.store.running(person)
+        totals = self._today(person, local)
+        if run is None:
+            return f"Таймер не идёт. {totals}", {"action": "status"}
+        left = max(0, int((run["ends_at"] - now).total_seconds()))
+        what = "Работа" if run["kind"] == "work" else "Перерыв"
+        passed = int((now - run["started_at"]).total_seconds() // 60)
+        return (f"{what}: осталось {fmt_minutes((left + 59) // 60)} (до "
+                f"{run['ends_at'].astimezone(local.tzinfo).strftime('%H:%M')}), прошло {fmt_minutes(passed)} из "
+                f"{fmt_minutes(run['minutes'])}. {totals}", {"action": "status"})
+
+    def _today(self, person: str, local: datetime) -> str:
+        since = datetime.combine(local.date(), time(0), tzinfo=local.tzinfo)
+        t = self.store.today_totals(person, since.astimezone(UTC))
+        if not t:
+            return "Сегодня сессий ещё не было."
+        return f"Сегодня: работа {fmt_minutes(t.get('work', 0))}, отдых {fmt_minutes(t.get('rest', 0))}."
+
+    def _do_where(self, person, cmd, said):
+        now = self.now()
+        local, place = self.local(person, now)
+        if place is None:
+            return (f"Место не записано. Время сервера: {fmt_local(local)}. Скажите, где вы: «я в Варшаве».",
+                    {"action": "where"})
+        w = self.weather(place)
+        return (f"Вы в городе {place['city']} ({place['country']}) с {_since(place, ZoneInfo(place['tz']))}.\n"
+                f"Местное время: {fmt_local(local)}.\n{weather_line(w)}" + self._plans_hint(person, now),
+                {"action": "where", "weather": w})
+
+    # ---------- окончание сессии (таймер) ----------
+
+    def compose_end(self, session: dict, now: datetime | None = None) -> tuple[str, dict]:
+        now = now or self.now()
+        ended = session["ends_at"]
+        place = self.place(session["person"], ended)
+        tz = self.tz_of(place)
+        local = ended.astimezone(tz)
+        work = session["kind"] == "work"
+        title = (f"Рабочая сессия {fmt_minutes(session['minutes'])} закончилась." if work
+                 else f"Перерыв {fmt_minutes(session['minutes'])} закончился.")
+        where = (f"{place['city']}: {fmt_local(local, seconds=True)}." if place
+                 else f"Время сервера: {fmt_local(local, seconds=True)} — место не указано.")
+        late = (now - ended).total_seconds()
+        if late > LATE_SECONDS:
+            where += f" Сообщение с опозданием на {fmt_minutes(int(late // 60))}: служба ядра была недоступна."
+        w = self.weather(place)
+        hint = "Пора отдохнуть: «перерыв 15 минут»." if work else "Продолжаем? «работаем час»."
+        text = "\n".join([title, where, weather_line(w), hint])
+        data = {"kind": session["kind"], "minutes": session["minutes"], "ended_at": ended.isoformat(),
+                "local_time": local.isoformat(), "utc_offset": utc_offset(local),
+                "city": place["city"] if place else None, "country": place["country"] if place else None,
+                "tz": place["tz"] if place else str(tz), "weather": w}
+        return text, data
+
+    def finish_due(self, limit: int = 20) -> list[dict]:
+        """Завершить сессии, у которых вышло время: сообщение с местным временем и погодой."""
+        out = []
+        for sess in self.store.claim_due(self.now(), limit):
+            try:
+                text, data = self.compose_end(sess)
+            except Exception as exc:  # noqa: BLE001 — сообщение всё равно нужно, хоть без погоды
+                text, data = (f"{'Рабочая сессия' if sess['kind'] == 'work' else 'Перерыв'} "
+                              f"{fmt_minutes(sess['minutes'])} закончилась.", {"error": str(exc)[:300]})
+            row = self.store.finish(sess, text, data, self.now())
+            if row:
+                out.append(row)
+        return out
+
+    # ---------- состояние для веба ----------
+
+    def state(self, person: str) -> dict[str, Any]:
+        now = self.now()
+        local, place = self.local(person, now)
+        run = self.store.running(person)
+        return {
+            "person": person,
+            "now": now.isoformat(),
+            "local_time": local.isoformat(),
+            "local_text": fmt_local(local),
+            "utc_offset": utc_offset(local),
+            "tz": place["tz"] if place else str(local.tzinfo),
+            "place": _place_out(place) if place else None,
+            "upcoming": [_place_out(u) for u in self.store.upcoming(person, now)],
+            "session": _session_out(run, now) if run else None,
+            "today": self._today(person, local),
+            "unread": [_notice_out(n) for n in self.store.notices(person, unread=True)],
+        }
+
+
+def weather_line(w: dict) -> str:
+    if w.get("ok"):
+        src = " (Яндекс Погода)" if "pogoda" in (w.get("url") or "") else ""
+        return f"Погода сейчас: {w['text']}{src}."
+    return f"Погоду получить не удалось: {w.get('reason', 'нет данных')}."
+
+
+def _since(place: dict, tz: tzinfo) -> str:
+    return place["effective_at"].astimezone(tz).strftime("%d.%m %H:%M")
+
+
+def _place_out(p: dict) -> dict:
+    return {"id": p["id"], "city": p["city"], "country": p["country"], "tz": p["tz"],
+            "since": _iso(p["effective_at"]), "date": move_day(p).isoformat(), "direction": p.get("direction")}
+
+
+def _session_out(r: dict, now: datetime) -> dict:
+    return {"id": r["id"], "kind": r["kind"], "minutes": r["minutes"], "started_at": _iso(r["started_at"]),
+            "ends_at": _iso(r["ends_at"]), "remaining_s": max(0, int((r["ends_at"] - now).total_seconds()))}
+
+
+def _notice_out(n: dict) -> dict:
+    return {"id": n["id"], "kind": n["kind"], "text": n["text"], "data": n["data"], "created_at": _iso(n["created_at"]),
+            "read": n["read_at"] is not None}
+
+
+# ---------- разбор моделью ----------
+
+MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "commands": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["place", "work", "rest", "stop", "status", "where",
+                                                          "history", "cancel_trip", "unknown"]},
+                    "place": {"type": "string", "description": "город, как сказано"},
+                    "date": {"type": "string", "description": "дата переезда YYYY-MM-DD, если названа"},
+                    "minutes": {"type": "integer"},
+                    "until": {"type": "string", "description": "время окончания HH:MM, если названо"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    "required": ["commands"],
+}
+
+
+def model_parse(text: str, today: date, settings) -> list[Command]:
+    from copilot1c.index.yandex import chat_json
+
+    data = chat_json(
+        f"Сегодня {today.isoformat()} ({WEEKDAY_NAMES[today.weekday()]}). Фраза: «{text}»", MODEL_SCHEMA,
+        model=settings.model_batch, settings=settings,
+        system="Ты секретарь. Разбери фразу в команды: place — человек находится или едет в город (date — когда, "
+               "если не сейчас); work — рабочая сессия на minutes минут или до until; rest — перерыв; stop — "
+               "остановить таймер; status — сколько осталось; where — где я, время, погода; history — где я был; "
+               "cancel_trip — отменить поездку. Не относится к этому — unknown.")
+    out = []
+    for c in data.get("commands", []):
+        a = c.get("action")
+        if a not in ("place", "work", "rest", "stop", "status", "where", "history", "cancel_trip"):
+            continue
+        when = None
+        if c.get("date"):
+            try:
+                when = date.fromisoformat(c["date"])
+            except ValueError:
+                when = None
+        until = None
+        if c.get("until"):
+            try:
+                until = time.fromisoformat(c["until"])
+            except ValueError:
+                until = None
+        minutes = c.get("minutes") if isinstance(c.get("minutes"), int) and 0 < c["minutes"] <= 720 else None
+        if a == "place" and not c.get("place"):
+            continue
+        out.append(Command(a, place=c.get("place"), when=when, minutes=minutes, until=until))
+    return out

@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     web_blocked_terms: StrList = ("Pierre Fabre", "Пьер Фабр")
     internal_domains: StrList = ()
     analyst_emails: StrList = ()
+    # Секретарь (вкладка «Секретарь»): непонятые правилами фразы и незнакомые города — моделью model_batch;
+    # погода сейчас — Yandex Search API по Яндекс Погоде + model_batch; пояс, если место не указано (пусто — пояс хоста)
+    secretary_llm: bool = True
+    secretary_weather: bool = True
+    secretary_default_tz: str = ""
     # Конвертация старых форматов (.doc, .xls, .rtf, .odt) через LibreOffice
     soffice_bin: str = "soffice"
 

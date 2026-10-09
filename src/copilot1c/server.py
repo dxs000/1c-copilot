@@ -52,6 +52,11 @@
         обращению относится, предложение «обновить ОБР-…» (что изменилось, комментарий, статус) / «новое» / «в базу».
         Письмо, прикреплённое к обращению, записывается в ветки переписки, ветка связывается с обращением, номера
         заявок из темы — в external_refs: следующий ответ по той же переписке узнаётся сам.
+  Секретарь (secretary/) — распорядок дня, записи по person (поле «Я»):
+  POST /secretary/say {person, text} — фраза («я в Варшаве», «работаем час», «стоп»…) → ответ, действия, состояние;
+  GET  /secretary/state?person= — место, местное время, идущая сессия, планы, непрочитанные сообщения таймера;
+  GET  /secretary/notices?person=&after= — сообщения таймера; POST /secretary/notices/{id}/read {person};
+  GET  /secretary/places?person= — журнал мест. Таймер — поток демона (secretary/timer.py), запускается с serve.
 """
 
 from __future__ import annotations
@@ -155,6 +160,16 @@ class ThreadPatch(BaseModel):
     title: str | None = Field(default=None, max_length=500)
     issue_id: int | None = None
     contours: list[int] | None = None
+
+
+class SecretarySay(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    person: str = Field(default="", max_length=200)
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class SecretaryPerson(BaseModel):
+    person: str = Field(default="", max_length=200)
 
 
 class ClassifyRequest(BaseModel):
@@ -367,21 +382,27 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
     """start_worker — запустить фоновую обработку загруженных материалов (так делает copilot1c serve)."""
     from contextlib import asynccontextmanager
 
+    from copilot1c.secretary.timer import SecretaryTimer
     from copilot1c.worker import MaterialWorker
 
     s = settings or get_settings()
     worker = MaterialWorker(s)
+    timer = SecretaryTimer(s)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         if start_worker:
             worker.start()
+            timer.start()
         yield
         if worker.running:
             worker.stop()
+        if timer.running:
+            timer.stop()
 
     app = FastAPI(title="1С Project Copilot — ядро", version=__version__, lifespan=lifespan)
     app.state.worker = worker
+    app.state.secretary_timer = timer
 
     @app.exception_handler(Exception)
     async def unexpected(request, exc: Exception):
@@ -399,6 +420,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
     def health() -> dict[str, Any]:
         report = health_report(s)
         report["checks"]["materials_worker"] = {"ok": worker.running, "busy": worker.busy, "optional": True}
+        report["checks"]["timer"] = {"ok": timer.running, "fired": timer.fired, "optional": True}
         return report
 
     @app.post("/ask")
@@ -1176,6 +1198,63 @@ def create_app(settings: Settings | None = None, start_worker: bool = False) -> 
         g, reg = _issues(s)
         try:
             return _call(lambda: reg.upsert_contact(req.name, req.email, req.organization, req.position, req.phone))
+        finally:
+            g.close()
+
+    # ---------- секретарь ----------
+
+    def _secretary():
+        from copilot1c.graph.store import try_connect
+        from copilot1c.secretary.service import Secretary
+
+        g = try_connect(s)
+        if g is None:
+            raise HTTPException(503, "PostgreSQL недоступен — секретарь не работает")
+        return g, Secretary(g.conn, s)
+
+    @app.post("/secretary/say")
+    def secretary_say(req: SecretarySay) -> dict[str, Any]:
+        g, sec = _secretary()
+        try:
+            return sec.say(req.person, req.text)
+        finally:
+            g.close()
+
+    @app.get("/secretary/state")
+    def secretary_state(person: str = "") -> dict[str, Any]:
+        g, sec = _secretary()
+        try:
+            return sec.state(person.strip())
+        finally:
+            g.close()
+
+    @app.get("/secretary/notices")
+    def secretary_notices(person: str = "", after: int = 0, unread: bool = False) -> dict[str, Any]:
+        from copilot1c.secretary.service import _notice_out
+
+        g, sec = _secretary()
+        try:
+            return {"notices": [_notice_out(n) for n in sec.store.notices(person.strip(), after, unread)]}
+        finally:
+            g.close()
+
+    @app.post("/secretary/notices/{notice_id}/read")
+    def secretary_notice_read(notice_id: int, req: SecretaryPerson) -> dict[str, Any]:
+        g, sec = _secretary()
+        try:
+            if not sec.store.mark_read(req.person.strip(), notice_id):
+                raise HTTPException(404, "Сообщение не найдено")
+            return {"ok": True}
+        finally:
+            g.close()
+
+    @app.get("/secretary/places")
+    def secretary_places(person: str = "", limit: int = 50) -> dict[str, Any]:
+        from copilot1c.secretary.service import _place_out
+
+        g, sec = _secretary()
+        try:
+            return {"places": [_place_out(p) for p in sec.store.history(person.strip(), min(max(limit, 1), 500))]}
         finally:
             g.close()
 
