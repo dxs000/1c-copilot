@@ -153,11 +153,13 @@ def web_search(query: str, settings, sites: list[str] | None = None, k: int = 5,
     sent, removed = sanitize_query(query, settings)
     clean_sites = [s.strip().lower() for s in sites or [] if re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", s.strip().lower())]
     text = sent + (" (" + " | ".join(f"site:{s}" for s in clean_sites[:5]) + ")" if clean_sites else "")
-    # Формат полей — как в примере документации Yandex (sync web search v2): короткие значения перечислений
-    body = {"query": {"searchType": "ru", "queryText": text[:400], "familyMode": "strict", "page": "0"},
-            "groupSpec": {"groupsOnPage": str(min(max(k, 1), 10))},
-            "maxPassages": "3", "region": "225", "l10N": "ru", "folderId": settings.yc_folder_id,
-            "responseFormat": "XML"}
+    # Поля и перечисления — по справочнику API (WebSearch/search, v2): полные имена значений (SEARCH_TYPE_RU …),
+    # поле локализации — «l10n». Короткие значения («ru», «XML») API отвергает: HTTP 400 «invalid value for enum».
+    body = {"query": {"searchType": "SEARCH_TYPE_RU", "queryText": text[:400], "familyMode": "FAMILY_MODE_STRICT",
+                      "page": "0", "fixTypoMode": "FIX_TYPO_MODE_ON"},
+            "groupSpec": {"groupMode": "GROUP_MODE_DEEP", "groupsOnPage": str(min(max(k, 1), 10)), "docsInGroup": "1"},
+            "maxPassages": "3", "region": "225", "l10n": "LOCALIZATION_RU", "folderId": settings.yc_folder_id,
+            "responseFormat": "FORMAT_XML"}
     c = client or httpx.Client(timeout=20)
     try:
         r = c.post(SEARCH_URL, json=body, headers={"Authorization": f"Api-Key {settings.yc_api_key}"})

@@ -70,6 +70,10 @@ def test_web_search_request_and_journal(tmp_path):
     out = web.web_search(f"pfmosvt1ceapp01 {ERROR}", s, sites=["its.1c.ru", "bad site"],
                          client=httpx.Client(transport=httpx.MockTransport(handler)))
     assert seen["auth"] == "Api-Key AQVN-key" and seen["body"]["folderId"] == "b1g"
+    body = seen["body"]  # полные имена перечислений API v2: короткие («ru», «XML») дают HTTP 400
+    assert body["query"]["searchType"] == "SEARCH_TYPE_RU" and body["query"]["familyMode"] == "FAMILY_MODE_STRICT"
+    assert body["responseFormat"] == "FORMAT_XML" and body["l10n"] == "LOCALIZATION_RU" and "l10N" not in body
+    assert body["groupSpec"]["groupMode"] == "GROUP_MODE_DEEP"
     q = seen["body"]["query"]["queryText"]
     assert "pfmosvt1ceapp01" not in q and q.endswith("(site:its.1c.ru)")  # мусор в sites отброшен
     assert len(out["results"]) == 2 and out["removed"]
